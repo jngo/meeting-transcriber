@@ -424,27 +424,20 @@ def write_final_transcript(md_path, start_time):
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 
-def run(md_path, mic_idx, dual, chunk_duration, duration_minutes=None):
+def run(md_path, mic_idx, dual, chunk_duration):
     global running
 
-    tmp       = Path(tempfile.mkdtemp(prefix="transcribe_"))
-    n         = 0
+    tmp        = Path(tempfile.mkdtemp(prefix="transcribe_"))
+    n          = 0
     start_time = datetime.datetime.now()
-
-    deadline = None
-    if duration_minutes:
-        deadline = start_time + datetime.timedelta(minutes=duration_minutes)
 
     # Initialise file with a blank slate for live streaming
     with open(md_path, "w") as f:
         f.write("")
 
-    mode    = "Dual (mic + system)" if dual else "Mic only"
-    dur_str = f" | Duration: {duration_minutes}min" if duration_minutes else ""
+    mode = "Dual (mic + system)" if dual else "Mic only"
     log(f"Output: {md_path}")
-    log(f"Mode: {mode} | Chunk: {chunk_duration}s{dur_str}")
-    if deadline:
-        log(f"Will auto-stop at {deadline.strftime('%H:%M:%S')}")
+    log(f"Mode: {mode} | Chunk: {chunk_duration}s")
     log("Recording — press Ctrl-C to stop\n")
 
     def on_signal(sig, _frame):
@@ -456,9 +449,6 @@ def run(md_path, mic_idx, dual, chunk_duration, duration_minutes=None):
 
     try:
         while running:
-            if deadline and datetime.datetime.now() >= deadline:
-                log(f"Duration reached ({duration_minutes}min) — stopping.")
-                break
 
             n += 1
             chunk_start = datetime.datetime.now()
@@ -519,19 +509,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s meeting.md                  Record mic + system audio
-  %(prog)s --duration 60 meeting.md    Auto-stop after 60 minutes
-  %(prog)s --mic-only notes.md         Mic only, no system audio
-  %(prog)s --devices                   List available microphones
-  %(prog)s --mic 2 meeting.md          Use a specific microphone
-  %(prog)s --setup                     Install dependencies only
+  %(prog)s meeting.md              Record mic + system audio
+  %(prog)s --mic-only notes.md     Mic only, no system audio
+  %(prog)s --devices               List available microphones
+  %(prog)s --mic 2 meeting.md      Use a specific microphone
+  %(prog)s --setup                 Install dependencies only
         """,
     )
     p.add_argument("file",      nargs="?", help="Markdown file to write transcript to")
     p.add_argument("--setup",   action="store_true", help="Install dependencies and exit")
     p.add_argument("--devices", action="store_true", help="List audio input devices")
-    p.add_argument("--duration", type=float, default=None, metavar="MIN",
-                   help="Auto-stop after this many minutes")
     p.add_argument("--mic",     type=int, default=None, metavar="IDX",
                    help="Microphone device index (default: auto-detect)")
     p.add_argument("--mic-only", action="store_true",
@@ -590,7 +577,7 @@ Examples:
     else:
         log("System audio: disabled (--mic-only)")
 
-    run(md_path, mic_idx, dual, args.chunk, args.duration)
+    run(md_path, mic_idx, dual, args.chunk)
 
 
 if __name__ == "__main__":
