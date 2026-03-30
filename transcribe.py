@@ -146,12 +146,28 @@ def ensure_system_audio_tap():
     log(f"Built: {SYSTEM_TAP_BIN}")
 
 
+def ensure_command():
+    """Make the script executable and symlink it as transcribe-meeting on PATH."""
+    script = Path(__file__).resolve()
+    script.chmod(script.stat().st_mode | 0o111)
+
+    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    link = bin_dir / "transcribe-meeting"
+    if not link.exists() or link.resolve() != script:
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(script)
+        log(f"Linked: transcribe-meeting → {script}")
+
+
 def setup():
     if not shutil.which("brew"):
         sys.exit("Error: Homebrew is required — https://brew.sh")
     ensure_ffmpeg()
     ensure_whisper()
     ensure_system_audio_tap()
+    ensure_command()
 
 
 # ── Audio devices ──────────────────────────────────────────────────────────
