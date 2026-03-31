@@ -162,6 +162,19 @@ def ensure_command():
         log(f"Linked: transcribe-meeting → {script}")
 
 
+def ensure_skill():
+    """Symlink the Claude skill into ~/.claude/skills/transcribe-meeting."""
+    skill_src = SCRIPT_DIR / "skill"
+    skills_dir = Path.home() / ".claude" / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    link = skills_dir / "transcribe-meeting"
+    if not link.exists() or (link.is_symlink() and link.resolve() != skill_src.resolve()):
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(skill_src)
+        log(f"Linked: ~/.claude/skills/transcribe-meeting → {skill_src}")
+
+
 def setup():
     if not shutil.which("brew"):
         sys.exit("Error: Homebrew is required — https://brew.sh")
@@ -169,6 +182,7 @@ def setup():
     ensure_whisper()
     ensure_system_audio_tap()
     ensure_command()
+    ensure_skill()
 
 
 # ── Audio inputs ───────────────────────────────────────────────────────────
