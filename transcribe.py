@@ -162,17 +162,25 @@ def ensure_command():
         log(f"Linked: transcribe-meeting → {script}")
 
 
+SKILL_CLIENTS = {
+    "claude": Path.home() / ".claude" / "skills",
+    "cursor": Path.home() / ".cursor" / "skills",
+}
+
+
 def ensure_skill():
-    """Symlink the Claude skill into ~/.claude/skills/transcribe-meeting."""
+    """Symlink the skill into each detected client's skills directory."""
     skill_src = SCRIPT_DIR / "skills" / "transcribe-meeting"
-    skills_dir = Path.home() / ".claude" / "skills"
-    skills_dir.mkdir(parents=True, exist_ok=True)
-    link = skills_dir / "transcribe-meeting"
-    if not link.exists() or (link.is_symlink() and link.resolve() != skill_src.resolve()):
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(skill_src)
-        log(f"Linked: ~/.claude/skills/transcribe-meeting → {skill_src}")
+    for client, skills_dir in SKILL_CLIENTS.items():
+        if not skills_dir.parent.exists():
+            continue
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        link = skills_dir / "transcribe-meeting"
+        if not link.exists() or (link.is_symlink() and link.resolve() != skill_src.resolve()):
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to(skill_src)
+            log(f"Linked: {client} skill → {skill_src}")
 
 
 def setup():
