@@ -2,9 +2,9 @@
 """
 transcribe.py — Record and transcribe a meeting to a Markdown file.
 
-Records microphone and system audio simultaneously. During the meeting a
+Records input and system audio simultaneously. During the meeting a
 plain-text live transcript is written to the output file in real time.
-When recording stops, a second pass merges both streams, deduplicates mic
+When recording stops, a second pass merges both streams, deduplicates input
 echoes, and overwrites the file with a clean speaker-attributed transcript.
 
 Usage:
@@ -194,7 +194,7 @@ def list_audio_inputs():
 
 # ── Recording ──────────────────────────────────────────────────────────────
 
-def record_mic_chunk(device_index, out_path, duration):
+def record_input_chunk(device_index, out_path, duration):
     cmd = [
         "ffmpeg", "-y",
         "-f", "avfoundation",
@@ -287,7 +287,7 @@ def _is_contained_fragment(short_text, long_text, max_ratio=0.4):
 
 
 def deduplicate(merged):
-    """Remove You segments that are mic echoes of Them segments.
+    """Remove You segments that are input echoes of Them segments.
 
     Compares every You segment against all Them segments within a ±10 second
     window. Drops the You segment if text similarity exceeds 0.5 or if it is
@@ -311,7 +311,7 @@ def deduplicate(merged):
                 break
 
     if drop:
-        log(f"Dedup: dropped {len(drop)} mic echo(es)")
+        log(f"Dedup: dropped {len(drop)} input echo(es)")
 
     return [seg for i, seg in enumerate(merged) if i not in drop]
 
@@ -338,19 +338,19 @@ def _append_session(md_path, dt, speaker, text):
 
 # ── Live transcript (pass 1) ───────────────────────────────────────────────
 
-def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
+def process_dual_chunk_live(input_wav, sys_wav, md_path, chunk_start):
     """Transcribe both streams, write plain text live, accumulate for pass 2."""
     sys_converted = None
     try:
         sys_converted = sys_wav.with_suffix(".16k.wav")
         convert_to_whisper_format(sys_wav, sys_converted)
 
-        mic_segs = transcribe_timestamped(mic_wav)
-        sys_segs = transcribe_timestamped(sys_converted)
+        input_segs = transcribe_timestamped(input_wav)
+        sys_segs   = transcribe_timestamped(sys_converted)
 
-        # Accumulate for final pass and persist to sidecar
+        # Accumulate for final pass and persist to session file
         with segments_lock:
-            for s, _e, t in mic_segs:
+            for s, _e, t in input_segs:
                 dt = chunk_start + datetime.timedelta(seconds=s)
                 all_segments.append((dt, "You", t))
                 _append_session(md_path, dt, "You", t)
@@ -362,7 +362,7 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
         # Write plain text to file (no attribution)
         all_text = " ".join(
             t for _, _, t in sorted(
-                [(s, "You", t) for s, _e, t in mic_segs] +
+                [(s, "You", t) for s, _e, t in input_segs] +
                 [(s, "Them", t) for s, _e, t in sys_segs],
                 key=lambda x: x[0],
             )
@@ -379,7 +379,7 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
     except Exception as exc:
         log(f"Transcription error: {exc}")
     finally:
-        for p in (mic_wav, sys_wav, sys_converted):
+        for p in (input_wav, sys_wav, sys_converted):
             if p and p.exists():
                 try:
                     os.unlink(p)
@@ -387,10 +387,10 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
                     pass
 
 
-def process_single_chunk_live(mic_wav, md_path, chunk_start):
-    """Transcribe mic only, write plain text live, accumulate for pass 2."""
+def process_single_chunk_live(input_wav, md_path, chunk_start):
+    """Transcribe input only, write plain text live, accumulate for pass 2."""
     try:
-        text = transcribe_plain(mic_wav)
+        text = transcribe_plain(input_wav)
         if not text:
             log("(no speech detected)")
             return
@@ -409,7 +409,7 @@ def process_single_chunk_live(mic_wav, md_path, chunk_start):
         log(f"Transcription error: {exc}")
     finally:
         try:
-            os.unlink(mic_wav)
+            os.unlink(input_wav)
         except OSError:
             pass
 
@@ -446,7 +446,7 @@ def write_final_transcript(md_path, start_time):
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 
-def run(md_path, mic_idx, dual, chunk_duration):
+def run(md_path, input_idx, dual, chunk_duration):
     global running
 
     tmp        = Path(tempfile.mkdtemp(prefix="transcribe_"))
@@ -475,8 +475,8 @@ def run(md_path, mic_idx, dual, chunk_duration):
             n += 1
             chunk_start = datetime.datetime.now()
 
-            mic_wav  = tmp / f"mic_{n:05d}.wav"
-            mic_proc = record_mic_chunk(mic_idx, mic_wav, chunk_duration)
+            input_wav  = tmp / f"input_{n:05d}.wav"
+            input_proc = record_input_chunk(input_idx, input_wav, chunk_duration)
 
             sys_proc = None
             sys_wav  = None
@@ -484,11 +484,11 @@ def run(md_path, mic_idx, dual, chunk_duration):
                 sys_wav  = tmp / f"sys_{n:05d}.wav"
                 sys_proc = record_system_chunk(sys_wav, chunk_duration)
 
-            mic_proc.wait()
+            input_proc.wait()
             if sys_proc:
                 sys_proc.wait()
 
-            if not mic_wav.exists() or mic_wav.stat().st_size < 1000:
+            if not input_wav.exists() or input_wav.stat().st_size < 1000:
                 if not running:
                     break
                 continue
@@ -496,7 +496,7 @@ def run(md_path, mic_idx, dual, chunk_duration):
             if dual and sys_wav and sys_wav.exists() and sys_wav.stat().st_size > 1000:
                 t = threading.Thread(
                     target=process_dual_chunk_live,
-                    args=(mic_wav, sys_wav, md_path, chunk_start),
+                    args=(input_wav, sys_wav, md_path, chunk_start),
                     daemon=True,
                 )
             else:
@@ -507,7 +507,7 @@ def run(md_path, mic_idx, dual, chunk_duration):
                         pass
                 t = threading.Thread(
                     target=process_single_chunk_live,
-                    args=(mic_wav, md_path, chunk_start),
+                    args=(input_wav, md_path, chunk_start),
                     daemon=True,
                 )
             t.start()

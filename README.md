@@ -2,7 +2,7 @@
 
 Records microphone and system audio simultaneously and produces a speaker-attributed Markdown transcript using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) with Metal acceleration.
 
-During recording, a plain-text live transcript is streamed to the output file. When you press Ctrl-C, a final pass merges both audio streams, deduplicates mic echoes of system audio, and overwrites the file with a clean attributed transcript.
+During recording, a plain-text live transcript is streamed to the output file. When you press Ctrl-C, a final pass merges both audio streams, deduplicates input echoes of system audio, and overwrites the file with a clean attributed transcript.
 
 ## Requirements
 
