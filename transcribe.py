@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-transcribe.py — Record and transcribe a meeting to a Markdown file.
+transcribe.py — Transcribe a meeting to a Markdown file.
 
-Records input and system audio simultaneously. During the meeting a
+Transcribes input and system audio simultaneously. During the meeting a
 plain-text live transcript is written to the output file in real time.
-When recording stops, a second pass merges both streams, deduplicates input
+When stopped, a second pass merges both streams, deduplicates input
 echoes, and overwrites the file with a clean speaker-attributed transcript.
 
 Usage:
@@ -192,7 +192,7 @@ def list_audio_inputs():
     return devices
 
 
-# ── Recording ──────────────────────────────────────────────────────────────
+# ── Audio capture ─────────────────────────────────────────────────────────
 
 def record_input_chunk(device_index, out_path, duration):
     cmd = [
@@ -325,7 +325,7 @@ def _session_path(md_path):
 def _append_session(md_path, dt, speaker, text):
     """Append a transcribed segment to the session file as a JSONL entry.
 
-    The session file persists all segments to disk throughout recording so they
+    The session file persists all segments to disk throughout a transcription so they
     survive a non-clean exit. On a normal Ctrl-C exit it is deleted silently by
     run(). If the process is killed before that (e.g. via TaskStop from Claude
     Code), run --recover to produce the final attributed transcript from it.
@@ -460,7 +460,7 @@ def run(md_path, input_idx, dual, chunk_duration):
     mode = "Input + system audio" if dual else "Input only"
     log(f"Output: {md_path}")
     log(f"Mode: {mode} | Chunk: {chunk_duration}s")
-    log("Recording — press Ctrl-C to stop\n")
+    log("Transcribing — press Ctrl-C to stop\n")
 
     def on_signal(sig, _frame):
         global running
@@ -531,7 +531,7 @@ def run(md_path, input_idx, dual, chunk_duration):
 def recover(md_path):
     """Produce the final attributed transcript from a session file.
 
-    Used when the recording was interrupted before the final pass could run —
+    Used when the transcription was interrupted before the final pass could run —
     for example, when stopped via TaskStop from Claude Code. The session file
     is deleted on success.
     """
@@ -574,27 +574,27 @@ def recover(md_path):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Record and transcribe a meeting to Markdown.",
+        description="Transcribe a meeting to Markdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s meeting.md                Record input + system audio
+  %(prog)s meeting.md                Transcribe with input + system audio
   %(prog)s --input-only notes.md     Input device only, no system audio
   %(prog)s --list-inputs             List available input devices
   %(prog)s --input 2 meeting.md      Use a specific input device
   %(prog)s --setup                   Install dependencies only
-  %(prog)s --recover meeting.md      Recover transcript from an interrupted recording
+  %(prog)s --recover meeting.md      Recover transcript from an interrupted transcription
         """,
     )
     p.add_argument("file",           nargs="?", help="Markdown file to write transcript to")
     p.add_argument("--setup",        action="store_true", help="Install dependencies and exit")
     p.add_argument("--list-inputs",  action="store_true", help="List available audio input devices")
     p.add_argument("--recover",      action="store_true",
-                   help="Recover transcript from an interrupted recording session")
+                   help="Recover transcript from an interrupted transcription session")
     p.add_argument("--input",        type=int, default=None, metavar="IDX",
                    help="Audio input device index (default: auto-detect)")
     p.add_argument("--input-only",   action="store_true",
-                   help="Record input device only, skip system audio")
+                   help="Transcribe input only, skip system audio")
     p.add_argument("--chunk",        type=int, default=DEFAULT_CHUNK, metavar="SEC",
                    help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})")
 
