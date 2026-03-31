@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-transcribe.py — Record and transcribe a meeting to a Markdown file.
+transcribe.py — Transcribe a meeting to a Markdown file.
 
-Records microphone and system audio simultaneously. During the meeting a
+Transcribes input and system audio simultaneously. During the meeting a
 plain-text live transcript is written to the output file in real time.
-When recording stops, a second pass merges both streams, deduplicates mic
+When stopped, a second pass merges both streams, deduplicates input
 echoes, and overwrites the file with a clean speaker-attributed transcript.
 
 Usage:
     python3 transcribe.py meeting.md
-    python3 transcribe.py --duration 60 meeting.md
-    python3 transcribe.py --mic-only meeting.md
-    python3 transcribe.py --devices
+    python3 transcribe.py --input-only meeting.md
+    python3 transcribe.py --list-inputs
     python3 transcribe.py --setup
 """
 
 import argparse
 import datetime
 import difflib
+import json
 import os
 import re
 import shutil
@@ -55,6 +55,7 @@ running        = True
 whisper_bin    = None
 pending_threads = []
 file_lock      = threading.Lock()
+session_lock   = threading.Lock()
 
 # Accumulated segments for the final attribution pass:
 # each entry is (absolute_datetime, "You"|"Them", text)
@@ -161,6 +162,19 @@ def ensure_command():
         log(f"Linked: transcribe-meeting → {script}")
 
 
+def ensure_skill():
+    """Symlink the Claude skill into ~/.claude/skills/transcribe-meeting."""
+    skill_src = SCRIPT_DIR / "skill"
+    skills_dir = Path.home() / ".claude" / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    link = skills_dir / "transcribe-meeting"
+    if not link.exists() or (link.is_symlink() and link.resolve() != skill_src.resolve()):
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(skill_src)
+        log(f"Linked: ~/.claude/skills/transcribe-meeting → {skill_src}")
+
+
 def setup():
     if not shutil.which("brew"):
         sys.exit("Error: Homebrew is required — https://brew.sh")
@@ -168,11 +182,12 @@ def setup():
     ensure_whisper()
     ensure_system_audio_tap()
     ensure_command()
+    ensure_skill()
 
 
-# ── Audio devices ──────────────────────────────────────────────────────────
+# ── Audio inputs ───────────────────────────────────────────────────────────
 
-def list_audio_devices():
+def list_audio_inputs():
     r = subprocess.run(
         ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
         capture_output=True,
@@ -191,9 +206,9 @@ def list_audio_devices():
     return devices
 
 
-# ── Recording ──────────────────────────────────────────────────────────────
+# ── Audio capture ─────────────────────────────────────────────────────────
 
-def record_mic_chunk(device_index, out_path, duration):
+def record_input_chunk(device_index, out_path, duration):
     cmd = [
         "ffmpeg", "-y",
         "-f", "avfoundation",
@@ -286,7 +301,7 @@ def _is_contained_fragment(short_text, long_text, max_ratio=0.4):
 
 
 def deduplicate(merged):
-    """Remove You segments that are mic echoes of Them segments.
+    """Remove You segments that are input echoes of Them segments.
 
     Compares every You segment against all Them segments within a ±10 second
     window. Drops the You segment if text similarity exceeds 0.5 or if it is
@@ -310,38 +325,58 @@ def deduplicate(merged):
                 break
 
     if drop:
-        log(f"Dedup: dropped {len(drop)} mic echo(es)")
+        log(f"Dedup: dropped {len(drop)} input echo(es)")
 
     return [seg for i, seg in enumerate(merged) if i not in drop]
 
 
+# ── Session file ───────────────────────────────────────────────────────────
+
+def _session_path(md_path):
+    return md_path.parent / (md_path.name + ".session")
+
+
+def _append_session(md_path, dt, speaker, text):
+    """Append a transcribed segment to the session file as a JSONL entry.
+
+    The session file persists all segments to disk throughout a transcription so they
+    survive a non-clean exit. On a normal Ctrl-C exit it is deleted silently by
+    run(). If the process is killed before that (e.g. via TaskStop from Claude
+    Code), run --recover to produce the final attributed transcript from it.
+    """
+    entry = json.dumps({"dt": dt.isoformat(), "speaker": speaker, "text": text})
+    with session_lock:
+        with open(_session_path(md_path), "a") as f:
+            f.write(entry + "\n")
+
+
 # ── Live transcript (pass 1) ───────────────────────────────────────────────
 
-def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
+def process_dual_chunk_live(input_wav, sys_wav, md_path, chunk_start):
     """Transcribe both streams, write plain text live, accumulate for pass 2."""
     sys_converted = None
     try:
         sys_converted = sys_wav.with_suffix(".16k.wav")
         convert_to_whisper_format(sys_wav, sys_converted)
 
-        mic_segs = transcribe_timestamped(mic_wav)
-        sys_segs = transcribe_timestamped(sys_converted)
+        input_segs = transcribe_timestamped(input_wav)
+        sys_segs   = transcribe_timestamped(sys_converted)
 
-        # Accumulate for final pass
+        # Accumulate for final pass and persist to session file
         with segments_lock:
-            for s, _e, t in mic_segs:
-                all_segments.append((
-                    chunk_start + datetime.timedelta(seconds=s), "You", t
-                ))
+            for s, _e, t in input_segs:
+                dt = chunk_start + datetime.timedelta(seconds=s)
+                all_segments.append((dt, "You", t))
+                _append_session(md_path, dt, "You", t)
             for s, _e, t in sys_segs:
-                all_segments.append((
-                    chunk_start + datetime.timedelta(seconds=s), "Them", t
-                ))
+                dt = chunk_start + datetime.timedelta(seconds=s)
+                all_segments.append((dt, "Them", t))
+                _append_session(md_path, dt, "Them", t)
 
         # Write plain text to file (no attribution)
         all_text = " ".join(
             t for _, _, t in sorted(
-                [(s, "You", t) for s, _e, t in mic_segs] +
+                [(s, "You", t) for s, _e, t in input_segs] +
                 [(s, "Them", t) for s, _e, t in sys_segs],
                 key=lambda x: x[0],
             )
@@ -358,7 +393,7 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
     except Exception as exc:
         log(f"Transcription error: {exc}")
     finally:
-        for p in (mic_wav, sys_wav, sys_converted):
+        for p in (input_wav, sys_wav, sys_converted):
             if p and p.exists():
                 try:
                     os.unlink(p)
@@ -366,16 +401,17 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
                     pass
 
 
-def process_single_chunk_live(mic_wav, md_path, chunk_start):
-    """Transcribe mic only, write plain text live, accumulate for pass 2."""
+def process_single_chunk_live(input_wav, md_path, chunk_start):
+    """Transcribe input only, write plain text live, accumulate for pass 2."""
     try:
-        text = transcribe_plain(mic_wav)
+        text = transcribe_plain(input_wav)
         if not text:
             log("(no speech detected)")
             return
 
         with segments_lock:
             all_segments.append((chunk_start, "You", text))
+        _append_session(md_path, chunk_start, "You", text)
 
         with file_lock:
             with open(md_path, "a") as f:
@@ -387,7 +423,7 @@ def process_single_chunk_live(mic_wav, md_path, chunk_start):
         log(f"Transcription error: {exc}")
     finally:
         try:
-            os.unlink(mic_wav)
+            os.unlink(input_wav)
         except OSError:
             pass
 
@@ -424,7 +460,7 @@ def write_final_transcript(md_path, start_time):
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 
-def run(md_path, mic_idx, dual, chunk_duration):
+def run(md_path, input_idx, dual, chunk_duration):
     global running
 
     tmp        = Path(tempfile.mkdtemp(prefix="transcribe_"))
@@ -435,10 +471,10 @@ def run(md_path, mic_idx, dual, chunk_duration):
     with open(md_path, "w") as f:
         f.write("")
 
-    mode = "Dual (mic + system)" if dual else "Mic only"
+    mode = "Input + system audio" if dual else "Input only"
     log(f"Output: {md_path}")
     log(f"Mode: {mode} | Chunk: {chunk_duration}s")
-    log("Recording — press Ctrl-C to stop\n")
+    log("Transcribing… (Ctrl-C to stop)\n")
 
     def on_signal(sig, _frame):
         global running
@@ -453,8 +489,8 @@ def run(md_path, mic_idx, dual, chunk_duration):
             n += 1
             chunk_start = datetime.datetime.now()
 
-            mic_wav  = tmp / f"mic_{n:05d}.wav"
-            mic_proc = record_mic_chunk(mic_idx, mic_wav, chunk_duration)
+            input_wav  = tmp / f"input_{n:05d}.wav"
+            input_proc = record_input_chunk(input_idx, input_wav, chunk_duration)
 
             sys_proc = None
             sys_wav  = None
@@ -462,11 +498,11 @@ def run(md_path, mic_idx, dual, chunk_duration):
                 sys_wav  = tmp / f"sys_{n:05d}.wav"
                 sys_proc = record_system_chunk(sys_wav, chunk_duration)
 
-            mic_proc.wait()
+            input_proc.wait()
             if sys_proc:
                 sys_proc.wait()
 
-            if not mic_wav.exists() or mic_wav.stat().st_size < 1000:
+            if not input_wav.exists() or input_wav.stat().st_size < 1000:
                 if not running:
                     break
                 continue
@@ -474,7 +510,7 @@ def run(md_path, mic_idx, dual, chunk_duration):
             if dual and sys_wav and sys_wav.exists() and sys_wav.stat().st_size > 1000:
                 t = threading.Thread(
                     target=process_dual_chunk_live,
-                    args=(mic_wav, sys_wav, md_path, chunk_start),
+                    args=(input_wav, sys_wav, md_path, chunk_start),
                     daemon=True,
                 )
             else:
@@ -485,7 +521,7 @@ def run(md_path, mic_idx, dual, chunk_duration):
                         pass
                 t = threading.Thread(
                     target=process_single_chunk_live,
-                    args=(mic_wav, md_path, chunk_start),
+                    args=(input_wav, md_path, chunk_start),
                     daemon=True,
                 )
             t.start()
@@ -499,34 +535,90 @@ def run(md_path, mic_idx, dual, chunk_duration):
                 t.join(timeout=60)
         shutil.rmtree(tmp, ignore_errors=True)
         write_final_transcript(md_path, start_time)
+        session = _session_path(md_path)
+        if session.exists():
+            session.unlink()
+
+
+# ── Recovery ───────────────────────────────────────────────────────────────
+
+def recover(md_path):
+    """Produce the final attributed transcript from a session file.
+
+    Used when the transcription was interrupted before the final pass could run —
+    for example, when stopped via TaskStop from Claude Code. The session file
+    is deleted on success.
+    """
+    session = _session_path(md_path)
+    if not session.exists():
+        sys.exit(f"No session file found at {session}\nNothing to recover.")
+
+    segments = []
+    with open(session) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                segments.append((
+                    datetime.datetime.fromisoformat(entry["dt"]),
+                    entry["speaker"],
+                    entry["text"],
+                ))
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if not segments:
+        log("Session file is empty — nothing to recover.")
+        session.unlink()
+        return
+
+    log(f"Recovering {len(segments)} segment(s)...")
+    global all_segments
+    with segments_lock:
+        all_segments = segments
+
+    start_time = segments[0][0]
+    write_final_transcript(md_path, start_time)
+    session.unlink()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(
-        description="Record and transcribe a meeting to Markdown.",
+        description="Transcribe a meeting to Markdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s meeting.md              Record mic + system audio
-  %(prog)s --mic-only notes.md     Mic only, no system audio
-  %(prog)s --devices               List available microphones
-  %(prog)s --mic 2 meeting.md      Use a specific microphone
-  %(prog)s --setup                 Install dependencies only
+  %(prog)s meeting.md                Transcribe with input and system audio
+  %(prog)s --input-only notes.md     Input device only, no system audio
+  %(prog)s --input 2 meeting.md      Use a specific input device
+  %(prog)s --list-inputs             List available input devices
+  %(prog)s --recover meeting.md      Recover transcript from an interrupted transcription
+  %(prog)s --setup                   Install dependencies only
         """,
     )
-    p.add_argument("file",      nargs="?", help="Markdown file to write transcript to")
-    p.add_argument("--setup",   action="store_true", help="Install dependencies and exit")
-    p.add_argument("--devices", action="store_true", help="List audio input devices")
-    p.add_argument("--mic",     type=int, default=None, metavar="IDX",
-                   help="Microphone device index (default: auto-detect)")
-    p.add_argument("--mic-only", action="store_true",
-                   help="Record microphone only, skip system audio")
-    p.add_argument("--chunk",   type=int, default=DEFAULT_CHUNK, metavar="SEC",
+    p.add_argument("file",           nargs="?", help="Markdown file to write transcript to")
+    p.add_argument("--input-only",   action="store_true",
+                   help="Transcribe input only, skip system audio")
+    p.add_argument("--input",        type=int, default=None, metavar="IDX",
+                   help="Audio input device index (default: auto-detect)")
+    p.add_argument("--chunk",        type=int, default=DEFAULT_CHUNK, metavar="SEC",
                    help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})")
+    p.add_argument("--list-inputs",  action="store_true", help="List available audio input devices")
+    p.add_argument("--recover",      action="store_true",
+                   help="Recover transcript from an interrupted transcription session")
+    p.add_argument("--setup",        action="store_true", help="Install dependencies")
 
     args = p.parse_args()
+
+    if args.recover:
+        if not args.file:
+            p.error("--recover requires a file path")
+        recover(Path(args.file).resolve())
+        return
 
     setup()
 
@@ -534,12 +626,12 @@ Examples:
         log("All dependencies ready.")
         return
 
-    if args.devices:
-        devs = list_audio_devices()
+    if args.list_inputs:
+        devs = list_audio_inputs()
         if not devs:
-            print("No audio devices found.")
+            print("No audio input devices found.")
         else:
-            print("Microphone devices (use index with --mic):\n")
+            print("Audio input devices (use index with --input):\n")
             for idx, name in devs:
                 print(f"  [{idx}]  {name}")
             print("\n  System audio is captured automatically via ScreenCaptureKit.")
@@ -551,33 +643,33 @@ Examples:
     md_path = Path(args.file).resolve()
     md_path.parent.mkdir(parents=True, exist_ok=True)
 
-    devs = list_audio_devices()
+    devs = list_audio_inputs()
     if not devs:
-        sys.exit("Error: no audio devices found")
+        sys.exit("Error: no audio input devices found")
 
-    mic_idx = args.mic
-    if mic_idx is None:
+    input_idx = args.input
+    if input_idx is None:
         for idx, name in devs:
             if "macbook" in name.lower() and "mic" in name.lower():
-                mic_idx = idx
+                input_idx = idx
                 break
-        if mic_idx is None:
-            mic_idx = devs[0][0]
+        if input_idx is None:
+            input_idx = devs[0][0]
 
-    mic_name = next((n for i, n in devs if i == mic_idx), f"Device {mic_idx}")
-    log(f"Mic: [{mic_idx}] {mic_name}")
+    input_name = next((n for i, n in devs if i == input_idx), f"Device {input_idx}")
+    log(f"Input: [{input_idx}] {input_name}")
 
     dual = False
-    if not args.mic_only:
+    if not args.input_only:
         if SYSTEM_TAP_BIN.exists() and os.access(SYSTEM_TAP_BIN, os.X_OK):
             dual = True
             log("System audio: ScreenCaptureKit")
         else:
             log("System audio: not available (run --setup to build system-audio-tap)")
     else:
-        log("System audio: disabled (--mic-only)")
+        log("System audio: disabled (--input-only)")
 
-    run(md_path, mic_idx, dual, args.chunk)
+    run(md_path, input_idx, dual, args.chunk)
 
 
 if __name__ == "__main__":
