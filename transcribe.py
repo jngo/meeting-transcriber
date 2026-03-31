@@ -317,32 +317,10 @@ def deduplicate(merged):
     return [seg for i, seg in enumerate(merged) if i not in drop]
 
 
-# ── Chunk processing ───────────────────────────────────────────────────────
-
-def _flush_transcript(md_path):
-    """Rewrite the output file with the current speaker-attributed transcript.
-
-    Called after every chunk so the file is always up to date on disk.
-    Safe to kill the process at any time — latest state is already saved.
-    """
-    with segments_lock:
-        merged = sorted(all_segments, key=lambda x: x[0])
-
-    merged = deduplicate(merged)
-    if not merged:
-        return
-
-    lines = [
-        f"**[{dt.strftime('%H:%M:%S')}] {speaker}:** {text}"
-        for dt, speaker, text in merged
-    ]
-    with file_lock:
-        with open(md_path, "w") as f:
-            f.write("\n\n".join(lines) + "\n")
-
+# ── Live transcript (pass 1) ───────────────────────────────────────────────
 
 def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
-    """Transcribe both streams, accumulate segments, flush attributed transcript."""
+    """Transcribe both streams, write plain text live, accumulate for pass 2."""
     sys_converted = None
     try:
         sys_converted = sys_wav.with_suffix(".16k.wav")
@@ -351,6 +329,7 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
         mic_segs = transcribe_timestamped(mic_wav)
         sys_segs = transcribe_timestamped(sys_converted)
 
+        # Accumulate for final pass
         with segments_lock:
             for s, _e, t in mic_segs:
                 all_segments.append((
@@ -361,12 +340,19 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
                     chunk_start + datetime.timedelta(seconds=s), "Them", t
                 ))
 
-        _flush_transcript(md_path)
-
+        # Write plain text to file (no attribution)
         all_text = " ".join(
-            t for s, _e, t in sorted(mic_segs + sys_segs, key=lambda x: x[0])
+            t for _, _, t in sorted(
+                [(s, "You", t) for s, _e, t in mic_segs] +
+                [(s, "Them", t) for s, _e, t in sys_segs],
+                key=lambda x: x[0],
+            )
         ).strip()
+
         if all_text:
+            with file_lock:
+                with open(md_path, "a") as f:
+                    f.write(all_text + " ")
             log(f"{all_text[:80]}{'...' if len(all_text) > 80 else ''}")
         else:
             log("(no speech detected)")
@@ -383,7 +369,7 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
 
 
 def process_single_chunk_live(mic_wav, md_path, chunk_start):
-    """Transcribe mic only, accumulate segments, flush attributed transcript."""
+    """Transcribe mic only, write plain text live, accumulate for pass 2."""
     try:
         text = transcribe_plain(mic_wav)
         if not text:
@@ -393,7 +379,10 @@ def process_single_chunk_live(mic_wav, md_path, chunk_start):
         with segments_lock:
             all_segments.append((chunk_start, "You", text))
 
-        _flush_transcript(md_path)
+        with file_lock:
+            with open(md_path, "a") as f:
+                f.write(text + " ")
+
         log(f"{text[:80]}{'...' if len(text) > 80 else ''}")
 
     except Exception as exc:
@@ -405,15 +394,33 @@ def process_single_chunk_live(mic_wav, md_path, chunk_start):
             pass
 
 
-# ── Final transcript ────────────────────────────────────────────────────────
+# ── Final transcript (pass 2) ──────────────────────────────────────────────
 
 def write_final_transcript(md_path, start_time):
-    """Flush the final attributed transcript and log duration."""
+    """Merge, deduplicate and write the attributed transcript, overwriting the file."""
     log("Writing final attributed transcript...")
-    _flush_transcript(md_path)
+
+    with segments_lock:
+        merged = sorted(all_segments, key=lambda x: x[0])
+
+    merged = deduplicate(merged)
+
+    if not merged:
+        log("No segments to write.")
+        return
+
+    lines = []
+    for dt, speaker, text in merged:
+        ts = dt.strftime("%H:%M:%S")
+        lines.append(f"**[{ts}] {speaker}:** {text}")
+
     duration = datetime.datetime.now() - start_time
     minutes  = int(duration.total_seconds() // 60)
     seconds  = int(duration.total_seconds() % 60)
+
+    with open(md_path, "w") as f:
+        f.write("\n\n".join(lines) + "\n")
+
     log(f"Done. Duration: {minutes}m {seconds}s — {md_path}")
 
 
@@ -425,6 +432,10 @@ def run(md_path, mic_idx, dual, chunk_duration):
     tmp        = Path(tempfile.mkdtemp(prefix="transcribe_"))
     n          = 0
     start_time = datetime.datetime.now()
+
+    # Initialise file with a blank slate for live streaming
+    with open(md_path, "w") as f:
+        f.write("")
 
     mode = "Dual (mic + system)" if dual else "Mic only"
     log(f"Output: {md_path}")
