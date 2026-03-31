@@ -460,7 +460,7 @@ def run(md_path, input_idx, dual, chunk_duration):
     mode = "Input + system audio" if dual else "Input only"
     log(f"Output: {md_path}")
     log(f"Mode: {mode} | Chunk: {chunk_duration}s")
-    log("Transcribing — press Ctrl-C to stop\n")
+    log("Transcribing… (Ctrl-C to stop)\n")
 
     def on_signal(sig, _frame):
         global running
@@ -578,7 +578,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s meeting.md                Transcribe with input + system audio
+  %(prog)s meeting.md                Transcribe with input and system audio
   %(prog)s --input-only notes.md     Input device only, no system audio
   %(prog)s --list-inputs             List available input devices
   %(prog)s --input 2 meeting.md      Use a specific input device
