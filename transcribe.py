@@ -164,7 +164,7 @@ def ensure_command():
 
 def ensure_skill():
     """Symlink the Claude skill into ~/.claude/skills/transcribe-meeting."""
-    skill_src = SCRIPT_DIR / "skill"
+    skill_src = SCRIPT_DIR / "skills" / "transcribe-meeting"
     skills_dir = Path.home() / ".claude" / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
     link = skills_dir / "transcribe-meeting"

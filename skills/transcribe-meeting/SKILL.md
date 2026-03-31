@@ -2,7 +2,7 @@
 name: transcribe-meeting
 description: Start, stop, and recover a meeting transcription session. Use when the user wants to transcribe a meeting from Claude Code.
 compatibility: Requires macOS 14+, Python 3.x, Homebrew, and Screen Recording permission for the terminal.
-allowed-tools: Bash, Read, TaskStop
+allowed-tools: Bash Read TaskStop
 metadata:
   author: jngo
   version: "2.0"
