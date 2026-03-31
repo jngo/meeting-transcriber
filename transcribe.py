@@ -594,23 +594,23 @@ def main():
 Examples:
   %(prog)s meeting.md                Transcribe with input and system audio
   %(prog)s --input-only notes.md     Input device only, no system audio
-  %(prog)s --list-inputs             List available input devices
   %(prog)s --input 2 meeting.md      Use a specific input device
-  %(prog)s --setup                   Install dependencies only
+  %(prog)s --list-inputs             List available input devices
   %(prog)s --recover meeting.md      Recover transcript from an interrupted transcription
+  %(prog)s --setup                   Install dependencies only
         """,
     )
     p.add_argument("file",           nargs="?", help="Markdown file to write transcript to")
-    p.add_argument("--setup",        action="store_true", help="Install dependencies and exit")
+    p.add_argument("--input-only",   action="store_true",
+                   help="Transcribe input only, skip system audio")
+    p.add_argument("--input",        type=int, default=None, metavar="IDX",
+                   help="Audio input device index (default: auto-detect)")
+    p.add_argument("--chunk",        type=int, default=DEFAULT_CHUNK, metavar="SEC",
+                   help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})")
     p.add_argument("--list-inputs",  action="store_true", help="List available audio input devices")
     p.add_argument("--recover",      action="store_true",
                    help="Recover transcript from an interrupted transcription session")
-    p.add_argument("--input",        type=int, default=None, metavar="IDX",
-                   help="Audio input device index (default: auto-detect)")
-    p.add_argument("--input-only",   action="store_true",
-                   help="Transcribe input only, skip system audio")
-    p.add_argument("--chunk",        type=int, default=DEFAULT_CHUNK, metavar="SEC",
-                   help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})")
+    p.add_argument("--setup",        action="store_true", help="Install dependencies")
 
     args = p.parse_args()
 

@@ -54,9 +54,9 @@ transcribe-meeting --setup
 | Argument | Required | Default | Description |
 |---|---|---|---|
 | `file` | Yes | — | Markdown file to write transcript to |
-| `--recover` | No | — | Recover transcript from an interrupted transcription session |
 | `--input-only` | No | Off | Transcribe input only, skip system audio |
 | `--input <IDX>` | No | Auto | Audio input device index |
 | `--chunk <SEC>` | No | 15 | Chunk duration in seconds |
 | `--list-inputs` | No | — | List available audio input devices |
+| `--recover` | No | — | Recover transcript from an interrupted transcription session |
 | `--setup` | No | — | Install dependencies only |
