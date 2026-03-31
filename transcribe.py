@@ -51,12 +51,10 @@ DEFAULT_CHUNK = 15  # seconds
 
 # ── Globals ────────────────────────────────────────────────────────────────
 
-running          = True
-whisper_bin      = None
-pending_threads  = []
-file_lock        = threading.Lock()
-current_mic_proc = None
-current_sys_proc = None
+running        = True
+whisper_bin    = None
+pending_threads = []
+file_lock      = threading.Lock()
 
 # Accumulated segments for the final attribution pass:
 # each entry is (absolute_datetime, "You"|"Them", text)
@@ -443,18 +441,8 @@ def run(md_path, mic_idx, dual, chunk_duration):
     log("Recording — press Ctrl-C to stop\n")
 
     def on_signal(sig, _frame):
-        global running, current_mic_proc, current_sys_proc
+        global running
         running = False
-        if current_mic_proc:
-            try:
-                current_mic_proc.terminate()
-            except Exception:
-                pass
-        if current_sys_proc:
-            try:
-                current_sys_proc.terminate()
-            except Exception:
-                pass
 
     signal.signal(signal.SIGINT,  on_signal)
     signal.signal(signal.SIGTERM, on_signal)
@@ -474,8 +462,6 @@ def run(md_path, mic_idx, dual, chunk_duration):
                 sys_wav  = tmp / f"sys_{n:05d}.wav"
                 sys_proc = record_system_chunk(sys_wav, chunk_duration)
 
-            current_mic_proc = mic_proc
-            current_sys_proc = sys_proc
             mic_proc.wait()
             if sys_proc:
                 sys_proc.wait()
