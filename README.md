@@ -23,7 +23,7 @@ Installs ffmpeg, builds whisper.cpp, downloads the `medium.en` model (~1.5 GB), 
 
 ```bash
 transcribe-meeting meeting.md
-transcribe-meeting --mic-only notes.md
+transcribe-meeting --input-only notes.md
 ```
 
 Press **Ctrl-C** to stop. The script finishes the current chunk, then writes the final attributed transcript.
@@ -32,10 +32,11 @@ Press **Ctrl-C** to stop. The script finishes the current chunk, then writes the
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mic-only` | Off | Record microphone only, skip system audio |
-| `--mic <IDX>` | Auto | Microphone device index |
+| `--input-only` | Off | Record input device only, skip system audio |
+| `--input <IDX>` | Auto | Audio input device index |
 | `--chunk <SEC>` | 15 | Chunk duration in seconds |
-| `--devices` | — | List available microphones |
+| `--list-inputs` | — | List available audio input devices |
+| `--recover` | — | Recover transcript from an interrupted recording |
 | `--setup` | — | Install dependencies only |
 
 ## Output format

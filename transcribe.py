@@ -9,9 +9,8 @@ echoes, and overwrites the file with a clean speaker-attributed transcript.
 
 Usage:
     python3 transcribe.py meeting.md
-    python3 transcribe.py --duration 60 meeting.md
-    python3 transcribe.py --mic-only meeting.md
-    python3 transcribe.py --devices
+    python3 transcribe.py --input-only meeting.md
+    python3 transcribe.py --list-inputs
     python3 transcribe.py --setup
 """
 
@@ -172,9 +171,9 @@ def setup():
     ensure_command()
 
 
-# ── Audio devices ──────────────────────────────────────────────────────────
+# ── Audio inputs ───────────────────────────────────────────────────────────
 
-def list_audio_devices():
+def list_audio_inputs():
     r = subprocess.run(
         ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
         capture_output=True,
@@ -458,7 +457,7 @@ def run(md_path, mic_idx, dual, chunk_duration):
     with open(md_path, "w") as f:
         f.write("")
 
-    mode = "Dual (mic + system)" if dual else "Mic only"
+    mode = "Input + system audio" if dual else "Input only"
     log(f"Output: {md_path}")
     log(f"Mode: {mode} | Chunk: {chunk_duration}s")
     log("Recording — press Ctrl-C to stop\n")
@@ -579,24 +578,24 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s meeting.md              Record mic + system audio
-  %(prog)s --mic-only notes.md     Mic only, no system audio
-  %(prog)s --devices               List available microphones
-  %(prog)s --mic 2 meeting.md      Use a specific microphone
-  %(prog)s --setup                 Install dependencies only
-  %(prog)s --recover meeting.md    Recover transcript from an interrupted recording
+  %(prog)s meeting.md                Record input + system audio
+  %(prog)s --input-only notes.md     Input device only, no system audio
+  %(prog)s --list-inputs             List available input devices
+  %(prog)s --input 2 meeting.md      Use a specific input device
+  %(prog)s --setup                   Install dependencies only
+  %(prog)s --recover meeting.md      Recover transcript from an interrupted recording
         """,
     )
-    p.add_argument("file",      nargs="?", help="Markdown file to write transcript to")
-    p.add_argument("--setup",   action="store_true", help="Install dependencies and exit")
-    p.add_argument("--devices", action="store_true", help="List audio input devices")
-    p.add_argument("--recover", action="store_true",
+    p.add_argument("file",           nargs="?", help="Markdown file to write transcript to")
+    p.add_argument("--setup",        action="store_true", help="Install dependencies and exit")
+    p.add_argument("--list-inputs",  action="store_true", help="List available audio input devices")
+    p.add_argument("--recover",      action="store_true",
                    help="Recover transcript from an interrupted recording session")
-    p.add_argument("--mic",     type=int, default=None, metavar="IDX",
-                   help="Microphone device index (default: auto-detect)")
-    p.add_argument("--mic-only", action="store_true",
-                   help="Record microphone only, skip system audio")
-    p.add_argument("--chunk",   type=int, default=DEFAULT_CHUNK, metavar="SEC",
+    p.add_argument("--input",        type=int, default=None, metavar="IDX",
+                   help="Audio input device index (default: auto-detect)")
+    p.add_argument("--input-only",   action="store_true",
+                   help="Record input device only, skip system audio")
+    p.add_argument("--chunk",        type=int, default=DEFAULT_CHUNK, metavar="SEC",
                    help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})")
 
     args = p.parse_args()
@@ -613,12 +612,12 @@ Examples:
         log("All dependencies ready.")
         return
 
-    if args.devices:
-        devs = list_audio_devices()
+    if args.list_inputs:
+        devs = list_audio_inputs()
         if not devs:
-            print("No audio devices found.")
+            print("No audio input devices found.")
         else:
-            print("Microphone devices (use index with --mic):\n")
+            print("Audio input devices (use index with --input):\n")
             for idx, name in devs:
                 print(f"  [{idx}]  {name}")
             print("\n  System audio is captured automatically via ScreenCaptureKit.")
@@ -630,33 +629,33 @@ Examples:
     md_path = Path(args.file).resolve()
     md_path.parent.mkdir(parents=True, exist_ok=True)
 
-    devs = list_audio_devices()
+    devs = list_audio_inputs()
     if not devs:
-        sys.exit("Error: no audio devices found")
+        sys.exit("Error: no audio input devices found")
 
-    mic_idx = args.mic
-    if mic_idx is None:
+    input_idx = args.input
+    if input_idx is None:
         for idx, name in devs:
             if "macbook" in name.lower() and "mic" in name.lower():
-                mic_idx = idx
+                input_idx = idx
                 break
-        if mic_idx is None:
-            mic_idx = devs[0][0]
+        if input_idx is None:
+            input_idx = devs[0][0]
 
-    mic_name = next((n for i, n in devs if i == mic_idx), f"Device {mic_idx}")
-    log(f"Mic: [{mic_idx}] {mic_name}")
+    input_name = next((n for i, n in devs if i == input_idx), f"Device {input_idx}")
+    log(f"Input: [{input_idx}] {input_name}")
 
     dual = False
-    if not args.mic_only:
+    if not args.input_only:
         if SYSTEM_TAP_BIN.exists() and os.access(SYSTEM_TAP_BIN, os.X_OK):
             dual = True
             log("System audio: ScreenCaptureKit")
         else:
             log("System audio: not available (run --setup to build system-audio-tap)")
     else:
-        log("System audio: disabled (--mic-only)")
+        log("System audio: disabled (--input-only)")
 
-    run(md_path, mic_idx, dual, args.chunk)
+    run(md_path, input_idx, dual, args.chunk)
 
 
 if __name__ == "__main__":
