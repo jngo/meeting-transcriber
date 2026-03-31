@@ -56,7 +56,7 @@ running        = True
 whisper_bin    = None
 pending_threads = []
 file_lock      = threading.Lock()
-sidecar_lock   = threading.Lock()
+session_lock   = threading.Lock()
 
 # Accumulated segments for the final attribution pass:
 # each entry is (absolute_datetime, "You"|"Them", text)
@@ -317,23 +317,23 @@ def deduplicate(merged):
     return [seg for i, seg in enumerate(merged) if i not in drop]
 
 
-# ── Sidecar ────────────────────────────────────────────────────────────────
+# ── Session file ───────────────────────────────────────────────────────────
 
-def _sidecar_path(md_path):
-    return md_path.parent / (md_path.name + ".segments")
+def _session_path(md_path):
+    return md_path.parent / (md_path.name + ".session")
 
 
-def _append_sidecar(md_path, dt, speaker, text):
-    """Append a single segment to the sidecar file as a JSONL entry.
+def _append_session(md_path, dt, speaker, text):
+    """Append a transcribed segment to the session file as a JSONL entry.
 
-    The sidecar persists all segments to disk so they survive a non-clean exit.
-    On a normal Ctrl-C exit the sidecar is deleted by run(). If the process is
-    killed before that (e.g. from Claude Code), run --recover to produce the
-    final attributed transcript from the sidecar.
+    The session file persists all segments to disk throughout recording so they
+    survive a non-clean exit. On a normal Ctrl-C exit it is deleted silently by
+    run(). If the process is killed before that (e.g. via TaskStop from Claude
+    Code), run --recover to produce the final attributed transcript from it.
     """
     entry = json.dumps({"dt": dt.isoformat(), "speaker": speaker, "text": text})
-    with sidecar_lock:
-        with open(_sidecar_path(md_path), "a") as f:
+    with session_lock:
+        with open(_session_path(md_path), "a") as f:
             f.write(entry + "\n")
 
 
@@ -354,11 +354,11 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
             for s, _e, t in mic_segs:
                 dt = chunk_start + datetime.timedelta(seconds=s)
                 all_segments.append((dt, "You", t))
-                _append_sidecar(md_path, dt, "You", t)
+                _append_session(md_path, dt, "You", t)
             for s, _e, t in sys_segs:
                 dt = chunk_start + datetime.timedelta(seconds=s)
                 all_segments.append((dt, "Them", t))
-                _append_sidecar(md_path, dt, "Them", t)
+                _append_session(md_path, dt, "Them", t)
 
         # Write plain text to file (no attribution)
         all_text = " ".join(
@@ -398,7 +398,7 @@ def process_single_chunk_live(mic_wav, md_path, chunk_start):
 
         with segments_lock:
             all_segments.append((chunk_start, "You", text))
-        _append_sidecar(md_path, chunk_start, "You", text)
+        _append_session(md_path, chunk_start, "You", text)
 
         with file_lock:
             with open(md_path, "a") as f:
@@ -522,26 +522,26 @@ def run(md_path, mic_idx, dual, chunk_duration):
                 t.join(timeout=60)
         shutil.rmtree(tmp, ignore_errors=True)
         write_final_transcript(md_path, start_time)
-        sidecar = _sidecar_path(md_path)
-        if sidecar.exists():
-            sidecar.unlink()
+        session = _session_path(md_path)
+        if session.exists():
+            session.unlink()
 
 
 # ── Recovery ───────────────────────────────────────────────────────────────
 
 def recover(md_path):
-    """Produce the final attributed transcript from a sidecar file.
+    """Produce the final attributed transcript from a session file.
 
-    Used when the recording process was killed before it could run the final
-    pass itself — for example, when stopped from Claude Code via TaskStop.
-    The sidecar is deleted on success.
+    Used when the recording was interrupted before the final pass could run —
+    for example, when stopped via TaskStop from Claude Code. The session file
+    is deleted on success.
     """
-    sidecar = _sidecar_path(md_path)
-    if not sidecar.exists():
-        sys.exit(f"No sidecar found at {sidecar}\nNothing to recover.")
+    session = _session_path(md_path)
+    if not session.exists():
+        sys.exit(f"No session file found at {session}\nNothing to recover.")
 
     segments = []
-    with open(sidecar) as f:
+    with open(session) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -557,19 +557,18 @@ def recover(md_path):
                 continue
 
     if not segments:
-        log("Sidecar is empty — nothing to recover.")
-        sidecar.unlink()
+        log("Session file is empty — nothing to recover.")
+        session.unlink()
         return
 
-    log(f"Recovering {len(segments)} segment(s) from sidecar...")
+    log(f"Recovering {len(segments)} segment(s)...")
     global all_segments
     with segments_lock:
         all_segments = segments
 
     start_time = segments[0][0]
     write_final_transcript(md_path, start_time)
-    sidecar.unlink()
-    log("Sidecar removed.")
+    session.unlink()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
@@ -585,14 +584,14 @@ Examples:
   %(prog)s --devices               List available microphones
   %(prog)s --mic 2 meeting.md      Use a specific microphone
   %(prog)s --setup                 Install dependencies only
-  %(prog)s --recover meeting.md    Recover transcript from sidecar after unclean exit
+  %(prog)s --recover meeting.md    Recover transcript from an interrupted recording
         """,
     )
     p.add_argument("file",      nargs="?", help="Markdown file to write transcript to")
     p.add_argument("--setup",   action="store_true", help="Install dependencies and exit")
     p.add_argument("--devices", action="store_true", help="List audio input devices")
     p.add_argument("--recover", action="store_true",
-                   help="Produce final transcript from sidecar after unclean exit")
+                   help="Recover transcript from an interrupted recording session")
     p.add_argument("--mic",     type=int, default=None, metavar="IDX",
                    help="Microphone device index (default: auto-detect)")
     p.add_argument("--mic-only", action="store_true",
