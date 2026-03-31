@@ -18,6 +18,7 @@ Usage:
 import argparse
 import datetime
 import difflib
+import json
 import os
 import re
 import shutil
@@ -55,6 +56,7 @@ running        = True
 whisper_bin    = None
 pending_threads = []
 file_lock      = threading.Lock()
+sidecar_lock   = threading.Lock()
 
 # Accumulated segments for the final attribution pass:
 # each entry is (absolute_datetime, "You"|"Them", text)
@@ -315,6 +317,26 @@ def deduplicate(merged):
     return [seg for i, seg in enumerate(merged) if i not in drop]
 
 
+# ── Sidecar ────────────────────────────────────────────────────────────────
+
+def _sidecar_path(md_path):
+    return md_path.parent / (md_path.name + ".segments")
+
+
+def _append_sidecar(md_path, dt, speaker, text):
+    """Append a single segment to the sidecar file as a JSONL entry.
+
+    The sidecar persists all segments to disk so they survive a non-clean exit.
+    On a normal Ctrl-C exit the sidecar is deleted by run(). If the process is
+    killed before that (e.g. from Claude Code), run --recover to produce the
+    final attributed transcript from the sidecar.
+    """
+    entry = json.dumps({"dt": dt.isoformat(), "speaker": speaker, "text": text})
+    with sidecar_lock:
+        with open(_sidecar_path(md_path), "a") as f:
+            f.write(entry + "\n")
+
+
 # ── Live transcript (pass 1) ───────────────────────────────────────────────
 
 def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
@@ -327,16 +349,16 @@ def process_dual_chunk_live(mic_wav, sys_wav, md_path, chunk_start):
         mic_segs = transcribe_timestamped(mic_wav)
         sys_segs = transcribe_timestamped(sys_converted)
 
-        # Accumulate for final pass
+        # Accumulate for final pass and persist to sidecar
         with segments_lock:
             for s, _e, t in mic_segs:
-                all_segments.append((
-                    chunk_start + datetime.timedelta(seconds=s), "You", t
-                ))
+                dt = chunk_start + datetime.timedelta(seconds=s)
+                all_segments.append((dt, "You", t))
+                _append_sidecar(md_path, dt, "You", t)
             for s, _e, t in sys_segs:
-                all_segments.append((
-                    chunk_start + datetime.timedelta(seconds=s), "Them", t
-                ))
+                dt = chunk_start + datetime.timedelta(seconds=s)
+                all_segments.append((dt, "Them", t))
+                _append_sidecar(md_path, dt, "Them", t)
 
         # Write plain text to file (no attribution)
         all_text = " ".join(
@@ -376,6 +398,7 @@ def process_single_chunk_live(mic_wav, md_path, chunk_start):
 
         with segments_lock:
             all_segments.append((chunk_start, "You", text))
+        _append_sidecar(md_path, chunk_start, "You", text)
 
         with file_lock:
             with open(md_path, "a") as f:
@@ -499,6 +522,54 @@ def run(md_path, mic_idx, dual, chunk_duration):
                 t.join(timeout=60)
         shutil.rmtree(tmp, ignore_errors=True)
         write_final_transcript(md_path, start_time)
+        sidecar = _sidecar_path(md_path)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+# ── Recovery ───────────────────────────────────────────────────────────────
+
+def recover(md_path):
+    """Produce the final attributed transcript from a sidecar file.
+
+    Used when the recording process was killed before it could run the final
+    pass itself — for example, when stopped from Claude Code via TaskStop.
+    The sidecar is deleted on success.
+    """
+    sidecar = _sidecar_path(md_path)
+    if not sidecar.exists():
+        sys.exit(f"No sidecar found at {sidecar}\nNothing to recover.")
+
+    segments = []
+    with open(sidecar) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                segments.append((
+                    datetime.datetime.fromisoformat(entry["dt"]),
+                    entry["speaker"],
+                    entry["text"],
+                ))
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if not segments:
+        log("Sidecar is empty — nothing to recover.")
+        sidecar.unlink()
+        return
+
+    log(f"Recovering {len(segments)} segment(s) from sidecar...")
+    global all_segments
+    with segments_lock:
+        all_segments = segments
+
+    start_time = segments[0][0]
+    write_final_transcript(md_path, start_time)
+    sidecar.unlink()
+    log("Sidecar removed.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
@@ -514,11 +585,14 @@ Examples:
   %(prog)s --devices               List available microphones
   %(prog)s --mic 2 meeting.md      Use a specific microphone
   %(prog)s --setup                 Install dependencies only
+  %(prog)s --recover meeting.md    Recover transcript from sidecar after unclean exit
         """,
     )
     p.add_argument("file",      nargs="?", help="Markdown file to write transcript to")
     p.add_argument("--setup",   action="store_true", help="Install dependencies and exit")
     p.add_argument("--devices", action="store_true", help="List audio input devices")
+    p.add_argument("--recover", action="store_true",
+                   help="Produce final transcript from sidecar after unclean exit")
     p.add_argument("--mic",     type=int, default=None, metavar="IDX",
                    help="Microphone device index (default: auto-detect)")
     p.add_argument("--mic-only", action="store_true",
@@ -527,6 +601,12 @@ Examples:
                    help=f"Chunk duration in seconds (default: {DEFAULT_CHUNK})")
 
     args = p.parse_args()
+
+    if args.recover:
+        if not args.file:
+            p.error("--recover requires a file path")
+        recover(Path(args.file).resolve())
+        return
 
     setup()
 
