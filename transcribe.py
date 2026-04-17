@@ -54,6 +54,7 @@ SYSTEM_RECOVERY_MAX_RETRIES = 2
 SYSTEM_CAPTURE_RECOVERY_ATTEMPTS = 4
 SYSTEM_CAPTURE_RECOVERY_TIMEOUT_SECONDS = 20
 SYSTEM_CAPTURE_RECOVERY_DELAY_SECONDS = 1
+INPUT_RECOVERY_PROBE_SECONDS = 2
 
 
 # ── Globals ────────────────────────────────────────────────────────────────
@@ -255,6 +256,60 @@ def record_system_chunk(out_path, duration):
     return subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
 
 
+def probe_input_audio_capture(device_index, duration=INPUT_RECOVERY_PROBE_SECONDS):
+    """Run a short microphone probe to verify input capture health."""
+    fd, probe_file = tempfile.mkstemp(prefix="transcribe_input_probe_", suffix=".wav")
+    os.close(fd)
+    probe_path = Path(probe_file)
+    try:
+        try:
+            os.unlink(probe_path)
+        except OSError:
+            pass
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "avfoundation",
+            "-i", f":{device_index}",
+            "-ac", "1",
+            "-ar", "16000",
+            "-t", str(duration),
+            "-loglevel", "error",
+            str(probe_path),
+        ]
+        timeout = max(10, int(duration * 4))
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        size = _audio_size(probe_path)
+        if r.returncode == 0 and size >= MIN_AUDIO_BYTES:
+            return True
+
+        tail = ""
+        if r.stderr.strip():
+            tail = r.stderr.strip().splitlines()[-1]
+        elif r.stdout.strip():
+            tail = r.stdout.strip().splitlines()[-1]
+        extra = f" — {tail}" if tail else ""
+        log(
+            "Warning: input audio probe failed "
+            f"(code={r.returncode}, bytes={size}){extra}"
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        log("Warning: input audio probe timed out")
+        return False
+    finally:
+        if probe_path.exists():
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+
+
 def probe_system_audio_capture(
     duration=SYSTEM_RECOVERY_PROBE_SECONDS,
     retries=SYSTEM_RECOVERY_MAX_RETRIES,
@@ -340,6 +395,51 @@ def recover_system_audio_capture(
         if sleep_for > 0:
             time.sleep(sleep_for)
 
+    return False
+
+
+def recover_system_audio_until_stopped(
+    context,
+    retry_delay=SYSTEM_CAPTURE_RECOVERY_DELAY_SECONDS,
+):
+    """Keep probing system audio until it recovers or the user stops the run."""
+    attempt = 0
+    while running:
+        attempt += 1
+        log(
+            f"{context}: system audio unavailable; "
+            f"retrying indefinitely (attempt {attempt})"
+        )
+        if probe_system_audio_capture(retries=1):
+            log(f"{context}: system audio capture recovered.")
+            return True
+        if not running:
+            break
+        if retry_delay > 0:
+            time.sleep(retry_delay)
+    return False
+
+
+def recover_input_audio_until_stopped(
+    context,
+    input_idx,
+    retry_delay=SYSTEM_CAPTURE_RECOVERY_DELAY_SECONDS,
+):
+    """Keep probing microphone capture until it recovers or user stops."""
+    attempt = 0
+    while running:
+        attempt += 1
+        log(
+            f"{context}: microphone unavailable; "
+            f"retrying indefinitely (attempt {attempt})"
+        )
+        if probe_input_audio_capture(input_idx):
+            log(f"{context}: microphone capture recovered.")
+            return True
+        if not running:
+            break
+        if retry_delay > 0:
+            time.sleep(retry_delay)
     return False
 
 
@@ -647,22 +747,33 @@ def run(md_path, input_idx, dual, chunk_duration):
             if sys_proc and sys_rc not in (None, 0):
                 log(f"Warning: system audio capture process exited with code {sys_rc} on chunk {n}")
 
-            if input_size < MIN_AUDIO_BYTES:
+            input_chunk_failed = (input_rc != 0 or input_size < MIN_AUDIO_BYTES)
+            if input_chunk_failed:
                 input_capture_fail_streak += 1
                 log(
-                    f"Warning: input chunk {n} was empty/too small ({input_size} bytes); "
-                    "skipping transcription for this chunk"
+                    f"Warning: input chunk {n} capture failed "
+                    f"(exit={input_rc}, bytes={input_size}); "
+                    "retrying microphone capture before continuing"
                 )
                 if input_capture_fail_streak == 2:
                     log("Hint: check microphone permissions and input device availability.")
+                recovered = recover_input_audio_until_stopped(
+                    f"Chunk {n} microphone recovery",
+                    input_idx,
+                )
                 for p in (input_wav, sys_wav):
                     if p and p.exists():
                         try:
                             os.unlink(p)
                         except OSError:
                             pass
-                if not running:
+                if not recovered:
                     break
+                input_capture_fail_streak = 0
+                log(
+                    f"Chunk {n}: microphone recovered after retries; "
+                    "skipping this chunk and continuing."
+                )
                 continue
             if input_capture_fail_streak:
                 log(f"Input capture recovered on chunk {n}")
@@ -677,7 +788,7 @@ def run(md_path, input_idx, dual, chunk_duration):
                     f"Warning: system audio chunk {n} was empty/too small ({sys_size} bytes); "
                     "retrying system audio capture before continuing"
                 )
-                recovered = recover_system_audio_capture(f"Chunk {n} recovery")
+                recovered = recover_system_audio_until_stopped(f"Chunk {n} recovery")
                 for p in (input_wav, sys_wav):
                     if p and p.exists():
                         try:
@@ -685,14 +796,6 @@ def run(md_path, input_idx, dual, chunk_duration):
                         except OSError:
                             pass
                 if not recovered:
-                    fatal_error = (
-                        "System audio capture failed and did not recover "
-                        f"within {SYSTEM_CAPTURE_RECOVERY_ATTEMPTS} attempts or "
-                        f"{SYSTEM_CAPTURE_RECOVERY_TIMEOUT_SECONDS}s. "
-                        "Stopping to avoid unexpected microphone-only transcription. "
-                        "Re-run with --input-only only if microphone-only mode is intended."
-                    )
-                    running = False
                     break
                 log(
                     f"Chunk {n}: system audio recovered after retries; "

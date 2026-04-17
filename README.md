@@ -30,7 +30,7 @@ transcribe-meeting --input-only notes.md
 
 Press **Ctrl-C** to stop. The script finishes the current chunk, then writes the final attributed transcript.
 
-By default, system audio is **required**. If ScreenCaptureKit capture fails, the script retries short recovery probes with an attempts/timeout budget and then exits with an error if recovery is not possible. Use `--input-only` only when microphone-only transcription is intentional.
+By default, system audio is **required**. If startup preflight cannot establish ScreenCaptureKit capture, the script retries within an attempts/timeout budget and then exits with an error if recovery is not possible. Once transcription is running, capture failures are retried indefinitely (with ongoing warnings) until recovery succeeds or you stop the run. Use `--input-only` only when microphone-only transcription is intentional.
 
 ## Options
 
