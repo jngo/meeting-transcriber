@@ -47,6 +47,7 @@ SYSTEM_TAP_BIN = SWIFT_PROJECT / ".build" / "release" / "system-audio-tap"
 # ── Configuration ──────────────────────────────────────────────────────────
 
 DEFAULT_CHUNK = 15  # seconds
+MIN_AUDIO_BYTES = 1000
 
 
 # ── Globals ────────────────────────────────────────────────────────────────
@@ -68,6 +69,15 @@ segments_lock = threading.Lock()
 def log(msg):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"\033[90m[{ts}]\033[0m {msg}", file=sys.stderr, flush=True)
+
+
+def _audio_size(path):
+    if not path or not path.exists():
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 # ── Setup ──────────────────────────────────────────────────────────────────
@@ -474,6 +484,8 @@ def run(md_path, input_idx, dual, chunk_duration):
     tmp        = Path(tempfile.mkdtemp(prefix="transcribe_"))
     n          = 0
     start_time = datetime.datetime.now()
+    input_capture_fail_streak = 0
+    system_capture_fail_streak = 0
 
     # Initialise file with a blank slate for live streaming
     with open(md_path, "w") as f:
@@ -496,6 +508,7 @@ def run(md_path, input_idx, dual, chunk_duration):
 
             n += 1
             chunk_start = datetime.datetime.now()
+            log(f"Chunk {n}: capturing audio...")
 
             input_wav  = tmp / f"input_{n:05d}.wav"
             input_proc = record_input_chunk(input_idx, input_wav, chunk_duration)
@@ -506,16 +519,67 @@ def run(md_path, input_idx, dual, chunk_duration):
                 sys_wav  = tmp / f"sys_{n:05d}.wav"
                 sys_proc = record_system_chunk(sys_wav, chunk_duration)
 
-            input_proc.wait()
+            input_rc = input_proc.wait()
+            sys_rc = None
             if sys_proc:
-                sys_proc.wait()
+                sys_rc = sys_proc.wait()
 
-            if not input_wav.exists() or input_wav.stat().st_size < 1000:
+            input_size = _audio_size(input_wav)
+            sys_size = _audio_size(sys_wav) if sys_wav else 0
+
+            if dual:
+                log(f"Chunk {n}: capture sizes input={input_size}B system={sys_size}B")
+            else:
+                log(f"Chunk {n}: capture size input={input_size}B")
+
+            if input_rc != 0:
+                log(f"Warning: input capture process exited with code {input_rc} on chunk {n}")
+            if sys_proc and sys_rc not in (None, 0):
+                log(f"Warning: system audio capture process exited with code {sys_rc} on chunk {n}")
+
+            if input_size < MIN_AUDIO_BYTES:
+                input_capture_fail_streak += 1
+                log(
+                    f"Warning: input chunk {n} was empty/too small ({input_size} bytes); "
+                    "skipping transcription for this chunk"
+                )
+                if input_capture_fail_streak == 2:
+                    log("Hint: check microphone permissions and input device availability.")
+                for p in (input_wav, sys_wav):
+                    if p and p.exists():
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
                 if not running:
                     break
                 continue
+            if input_capture_fail_streak:
+                log(f"Input capture recovered on chunk {n}")
+                input_capture_fail_streak = 0
 
-            if dual and sys_wav and sys_wav.exists() and sys_wav.stat().st_size > 1000:
+            use_system_audio = (
+                dual and
+                sys_wav is not None and
+                sys_size >= MIN_AUDIO_BYTES
+            )
+            if dual and not use_system_audio:
+                system_capture_fail_streak += 1
+                log(
+                    f"Warning: system audio chunk {n} was empty/too small ({sys_size} bytes); "
+                    "falling back to input-only transcription for this chunk"
+                )
+                if system_capture_fail_streak == 2:
+                    log(
+                        "Hint: ScreenCaptureKit may be stalled. Verify Screen Recording "
+                        "permissions and consider restarting the terminal or rebooting."
+                    )
+            elif dual:
+                if system_capture_fail_streak:
+                    log(f"System audio capture recovered on chunk {n}")
+                system_capture_fail_streak = 0
+
+            if use_system_audio:
                 t = threading.Thread(
                     target=process_dual_chunk_live,
                     args=(input_wav, sys_wav, md_path, chunk_start),
