@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 
@@ -50,8 +51,9 @@ DEFAULT_CHUNK = 15  # seconds
 MIN_AUDIO_BYTES = 1000
 SYSTEM_RECOVERY_PROBE_SECONDS = 3
 SYSTEM_RECOVERY_MAX_RETRIES = 2
-SYSTEM_RECHECK_INTERVAL_CHUNKS = 4
-SYSTEM_FAILURE_STREAK_FOR_RECOVERY = 2
+SYSTEM_CAPTURE_RECOVERY_ATTEMPTS = 4
+SYSTEM_CAPTURE_RECOVERY_TIMEOUT_SECONDS = 20
+SYSTEM_CAPTURE_RECOVERY_DELAY_SECONDS = 1
 
 
 # ── Globals ────────────────────────────────────────────────────────────────
@@ -312,6 +314,35 @@ def probe_system_audio_capture(
     return False
 
 
+def recover_system_audio_capture(
+    context,
+    max_attempts=SYSTEM_CAPTURE_RECOVERY_ATTEMPTS,
+    timeout_seconds=SYSTEM_CAPTURE_RECOVERY_TIMEOUT_SECONDS,
+    retry_delay=SYSTEM_CAPTURE_RECOVERY_DELAY_SECONDS,
+):
+    """Retry system-audio probes until attempts/deadline are exhausted."""
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    attempt = 0
+
+    while attempt < max_attempts and running:
+        attempt += 1
+        remaining = max(0, int(deadline - time.monotonic()))
+        log(
+            f"{context}: retrying system audio capture "
+            f"(attempt {attempt}/{max_attempts}, ~{remaining}s remaining)"
+        )
+        if probe_system_audio_capture(retries=1):
+            log(f"{context}: system audio capture recovered.")
+            return True
+        if attempt >= max_attempts or time.monotonic() >= deadline:
+            break
+        sleep_for = min(retry_delay, max(0.0, deadline - time.monotonic()))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    return False
+
+
 # ── Transcription ──────────────────────────────────────────────────────────
 
 def convert_to_whisper_format(in_path, out_path):
@@ -548,34 +579,17 @@ def run(md_path, input_idx, dual, chunk_duration):
     n          = 0
     start_time = datetime.datetime.now()
     input_capture_fail_streak = 0
-    system_capture_fail_streak = 0
     dual_requested = dual
-    system_audio_enabled = dual_requested
-    next_system_audio_recheck = 0
+    fatal_error = None
 
     # Initialise file with a blank slate for live streaming
     with open(md_path, "w") as f:
         f.write("")
 
-    mode = "Input + system audio" if dual else "Input only"
+    mode = "Input + system audio (required)" if dual else "Input only"
     log(f"Output: {md_path}")
     log(f"Mode: {mode} | Chunk: {chunk_duration}s")
     log("Transcribing… (Ctrl-C to stop)\n")
-    if dual_requested:
-        log("Running system audio preflight check...")
-        if probe_system_audio_capture(retries=1):
-            log("System audio preflight check passed.")
-        else:
-            log("Warning: system audio preflight failed; attempting auto-recovery...")
-            if probe_system_audio_capture():
-                log("Auto-recovery succeeded before chunking started.")
-            else:
-                system_audio_enabled = False
-                next_system_audio_recheck = SYSTEM_RECHECK_INTERVAL_CHUNKS
-                log(
-                    "Warning: starting in input-only mode; "
-                    f"will retry system audio every {SYSTEM_RECHECK_INTERVAL_CHUNKS} chunks."
-                )
 
     def on_signal(sig, _frame):
         global running
@@ -585,22 +599,25 @@ def run(md_path, input_idx, dual, chunk_duration):
     signal.signal(signal.SIGTERM, on_signal)
 
     try:
-        while running:
+        if dual_requested:
+            log("Running system audio preflight check...")
+            if probe_system_audio_capture(retries=1):
+                log("System audio preflight check passed.")
+            else:
+                log("Warning: system audio preflight failed; entering retry window...")
+                recovered = recover_system_audio_capture("Preflight recovery")
+                if not recovered:
+                    fatal_error = (
+                        "System audio capture failed during startup and did not recover "
+                        f"within {SYSTEM_CAPTURE_RECOVERY_ATTEMPTS} attempts or "
+                        f"{SYSTEM_CAPTURE_RECOVERY_TIMEOUT_SECONDS}s. "
+                        "Re-run with --input-only only if microphone-only mode is intended."
+                    )
+
+        while running and not fatal_error:
 
             n += 1
             chunk_start = datetime.datetime.now()
-            if dual_requested and not system_audio_enabled and n >= next_system_audio_recheck:
-                log(f"Auto-recovery: retrying system audio before chunk {n}...")
-                if probe_system_audio_capture(retries=1):
-                    system_audio_enabled = True
-                    system_capture_fail_streak = 0
-                    log(f"System audio capture re-enabled on chunk {n}")
-                else:
-                    next_system_audio_recheck = n + SYSTEM_RECHECK_INTERVAL_CHUNKS
-                    log(
-                        "System audio still unavailable; "
-                        f"next retry at chunk {next_system_audio_recheck}"
-                    )
             log(f"Chunk {n}: capturing audio...")
 
             input_wav  = tmp / f"input_{n:05d}.wav"
@@ -608,7 +625,7 @@ def run(md_path, input_idx, dual, chunk_duration):
 
             sys_proc = None
             sys_wav  = None
-            if system_audio_enabled:
+            if dual_requested:
                 sys_wav  = tmp / f"sys_{n:05d}.wav"
                 sys_proc = record_system_chunk(sys_wav, chunk_duration)
 
@@ -620,10 +637,8 @@ def run(md_path, input_idx, dual, chunk_duration):
             input_size = _audio_size(input_wav)
             sys_size = _audio_size(sys_wav) if sys_wav else 0
 
-            if dual_requested and system_audio_enabled:
+            if dual_requested:
                 log(f"Chunk {n}: capture sizes input={input_size}B system={sys_size}B")
-            elif dual_requested:
-                log(f"Chunk {n}: capture size input={input_size}B (system audio disabled)")
             else:
                 log(f"Chunk {n}: capture size input={input_size}B")
 
@@ -653,53 +668,45 @@ def run(md_path, input_idx, dual, chunk_duration):
                 log(f"Input capture recovered on chunk {n}")
                 input_capture_fail_streak = 0
 
-            use_system_audio = (
-                system_audio_enabled and
-                sys_wav is not None and
-                sys_size >= MIN_AUDIO_BYTES
+            system_chunk_failed = (
+                dual_requested and
+                (sys_rc not in (None, 0) or sys_size < MIN_AUDIO_BYTES)
             )
-            if system_audio_enabled and not use_system_audio:
-                system_capture_fail_streak += 1
+            if system_chunk_failed:
                 log(
                     f"Warning: system audio chunk {n} was empty/too small ({sys_size} bytes); "
-                    "falling back to input-only transcription for this chunk"
+                    "retrying system audio capture before continuing"
                 )
-                if system_capture_fail_streak == SYSTEM_FAILURE_STREAK_FOR_RECOVERY:
-                    log(
-                        "Auto-recovery: repeated system-audio failures detected; "
-                        "probing ScreenCaptureKit health..."
+                recovered = recover_system_audio_capture(f"Chunk {n} recovery")
+                for p in (input_wav, sys_wav):
+                    if p and p.exists():
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+                if not recovered:
+                    fatal_error = (
+                        "System audio capture failed and did not recover "
+                        f"within {SYSTEM_CAPTURE_RECOVERY_ATTEMPTS} attempts or "
+                        f"{SYSTEM_CAPTURE_RECOVERY_TIMEOUT_SECONDS}s. "
+                        "Stopping to avoid unexpected microphone-only transcription. "
+                        "Re-run with --input-only only if microphone-only mode is intended."
                     )
-                    if probe_system_audio_capture():
-                        system_capture_fail_streak = 0
-                        log("Auto-recovery: system audio probe succeeded; retrying next chunk.")
-                    else:
-                        system_audio_enabled = False
-                        next_system_audio_recheck = n + SYSTEM_RECHECK_INTERVAL_CHUNKS
-                        log(
-                            "Warning: system audio is temporarily disabled after recovery failure; "
-                            f"next retry at chunk {next_system_audio_recheck}"
-                        )
-                        log(
-                            "Hint: if recovery keeps failing, verify Screen Recording permissions "
-                            "or reboot to reset ScreenCaptureKit."
-                        )
-            elif dual_requested and system_audio_enabled:
-                if system_capture_fail_streak:
-                    log(f"System audio capture recovered on chunk {n}")
-                system_capture_fail_streak = 0
+                    running = False
+                    break
+                log(
+                    f"Chunk {n}: system audio recovered after retries; "
+                    "skipping this chunk and continuing in dual mode."
+                )
+                continue
 
-            if use_system_audio:
+            if dual_requested:
                 t = threading.Thread(
                     target=process_dual_chunk_live,
                     args=(input_wav, sys_wav, md_path, chunk_start),
                     daemon=True,
                 )
             else:
-                if sys_wav and sys_wav.exists():
-                    try:
-                        os.unlink(sys_wav)
-                    except OSError:
-                        pass
                 t = threading.Thread(
                     target=process_single_chunk_live,
                     args=(input_wav, md_path, chunk_start),
@@ -719,6 +726,8 @@ def run(md_path, input_idx, dual, chunk_duration):
         session = _session_path(md_path)
         if session.exists():
             session.unlink()
+    if fatal_error:
+        raise RuntimeError(fatal_error)
 
 
 # ── Recovery ───────────────────────────────────────────────────────────────
@@ -850,7 +859,10 @@ Examples:
     else:
         log("System audio: disabled (--input-only)")
 
-    run(md_path, input_idx, dual, args.chunk)
+    try:
+        run(md_path, input_idx, dual, args.chunk)
+    except RuntimeError as exc:
+        sys.exit(f"Error: {exc}")
 
 
 if __name__ == "__main__":
