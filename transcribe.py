@@ -48,6 +48,10 @@ SYSTEM_TAP_BIN = SWIFT_PROJECT / ".build" / "release" / "system-audio-tap"
 
 DEFAULT_CHUNK = 15  # seconds
 MIN_AUDIO_BYTES = 1000
+SYSTEM_RECOVERY_PROBE_SECONDS = 3
+SYSTEM_RECOVERY_MAX_RETRIES = 2
+SYSTEM_RECHECK_INTERVAL_CHUNKS = 4
+SYSTEM_FAILURE_STREAK_FOR_RECOVERY = 2
 
 
 # ── Globals ────────────────────────────────────────────────────────────────
@@ -247,6 +251,65 @@ def record_system_chunk(out_path, duration):
         "--duration", str(duration),
     ]
     return subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+
+
+def probe_system_audio_capture(
+    duration=SYSTEM_RECOVERY_PROBE_SECONDS,
+    retries=SYSTEM_RECOVERY_MAX_RETRIES,
+):
+    """Run short ScreenCaptureKit probes to verify system audio capture health."""
+    if not (SYSTEM_TAP_BIN.exists() and os.access(SYSTEM_TAP_BIN, os.X_OK)):
+        return False
+
+    for attempt in range(1, retries + 1):
+        fd, probe_file = tempfile.mkstemp(prefix="transcribe_probe_", suffix=".wav")
+        os.close(fd)
+        probe_path = Path(probe_file)
+        try:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+
+            cmd = [
+                str(SYSTEM_TAP_BIN),
+                "--output", str(probe_path),
+                "--duration", str(duration),
+            ]
+            timeout = max(10, int(duration * 4))
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            size = _audio_size(probe_path)
+            if r.returncode == 0 and size >= MIN_AUDIO_BYTES:
+                log(
+                    f"System audio probe succeeded "
+                    f"(attempt {attempt}/{retries}, {size} bytes)"
+                )
+                return True
+
+            tail = ""
+            if r.stderr.strip():
+                tail = r.stderr.strip().splitlines()[-1]
+            elif r.stdout.strip():
+                tail = r.stdout.strip().splitlines()[-1]
+            extra = f" — {tail}" if tail else ""
+            log(
+                "Warning: system audio probe failed "
+                f"(attempt {attempt}/{retries}, code={r.returncode}, bytes={size}){extra}"
+            )
+        except subprocess.TimeoutExpired:
+            log(f"Warning: system audio probe timed out (attempt {attempt}/{retries})")
+        finally:
+            if probe_path.exists():
+                try:
+                    os.unlink(probe_path)
+                except OSError:
+                    pass
+    return False
 
 
 # ── Transcription ──────────────────────────────────────────────────────────
@@ -486,6 +549,9 @@ def run(md_path, input_idx, dual, chunk_duration):
     start_time = datetime.datetime.now()
     input_capture_fail_streak = 0
     system_capture_fail_streak = 0
+    dual_requested = dual
+    system_audio_enabled = dual_requested
+    next_system_audio_recheck = 0
 
     # Initialise file with a blank slate for live streaming
     with open(md_path, "w") as f:
@@ -495,6 +561,21 @@ def run(md_path, input_idx, dual, chunk_duration):
     log(f"Output: {md_path}")
     log(f"Mode: {mode} | Chunk: {chunk_duration}s")
     log("Transcribing… (Ctrl-C to stop)\n")
+    if dual_requested:
+        log("Running system audio preflight check...")
+        if probe_system_audio_capture(retries=1):
+            log("System audio preflight check passed.")
+        else:
+            log("Warning: system audio preflight failed; attempting auto-recovery...")
+            if probe_system_audio_capture():
+                log("Auto-recovery succeeded before chunking started.")
+            else:
+                system_audio_enabled = False
+                next_system_audio_recheck = SYSTEM_RECHECK_INTERVAL_CHUNKS
+                log(
+                    "Warning: starting in input-only mode; "
+                    f"will retry system audio every {SYSTEM_RECHECK_INTERVAL_CHUNKS} chunks."
+                )
 
     def on_signal(sig, _frame):
         global running
@@ -508,6 +589,18 @@ def run(md_path, input_idx, dual, chunk_duration):
 
             n += 1
             chunk_start = datetime.datetime.now()
+            if dual_requested and not system_audio_enabled and n >= next_system_audio_recheck:
+                log(f"Auto-recovery: retrying system audio before chunk {n}...")
+                if probe_system_audio_capture(retries=1):
+                    system_audio_enabled = True
+                    system_capture_fail_streak = 0
+                    log(f"System audio capture re-enabled on chunk {n}")
+                else:
+                    next_system_audio_recheck = n + SYSTEM_RECHECK_INTERVAL_CHUNKS
+                    log(
+                        "System audio still unavailable; "
+                        f"next retry at chunk {next_system_audio_recheck}"
+                    )
             log(f"Chunk {n}: capturing audio...")
 
             input_wav  = tmp / f"input_{n:05d}.wav"
@@ -515,7 +608,7 @@ def run(md_path, input_idx, dual, chunk_duration):
 
             sys_proc = None
             sys_wav  = None
-            if dual:
+            if system_audio_enabled:
                 sys_wav  = tmp / f"sys_{n:05d}.wav"
                 sys_proc = record_system_chunk(sys_wav, chunk_duration)
 
@@ -527,8 +620,10 @@ def run(md_path, input_idx, dual, chunk_duration):
             input_size = _audio_size(input_wav)
             sys_size = _audio_size(sys_wav) if sys_wav else 0
 
-            if dual:
+            if dual_requested and system_audio_enabled:
                 log(f"Chunk {n}: capture sizes input={input_size}B system={sys_size}B")
+            elif dual_requested:
+                log(f"Chunk {n}: capture size input={input_size}B (system audio disabled)")
             else:
                 log(f"Chunk {n}: capture size input={input_size}B")
 
@@ -559,22 +654,36 @@ def run(md_path, input_idx, dual, chunk_duration):
                 input_capture_fail_streak = 0
 
             use_system_audio = (
-                dual and
+                system_audio_enabled and
                 sys_wav is not None and
                 sys_size >= MIN_AUDIO_BYTES
             )
-            if dual and not use_system_audio:
+            if system_audio_enabled and not use_system_audio:
                 system_capture_fail_streak += 1
                 log(
                     f"Warning: system audio chunk {n} was empty/too small ({sys_size} bytes); "
                     "falling back to input-only transcription for this chunk"
                 )
-                if system_capture_fail_streak == 2:
+                if system_capture_fail_streak == SYSTEM_FAILURE_STREAK_FOR_RECOVERY:
                     log(
-                        "Hint: ScreenCaptureKit may be stalled. Verify Screen Recording "
-                        "permissions and consider restarting the terminal or rebooting."
+                        "Auto-recovery: repeated system-audio failures detected; "
+                        "probing ScreenCaptureKit health..."
                     )
-            elif dual:
+                    if probe_system_audio_capture():
+                        system_capture_fail_streak = 0
+                        log("Auto-recovery: system audio probe succeeded; retrying next chunk.")
+                    else:
+                        system_audio_enabled = False
+                        next_system_audio_recheck = n + SYSTEM_RECHECK_INTERVAL_CHUNKS
+                        log(
+                            "Warning: system audio is temporarily disabled after recovery failure; "
+                            f"next retry at chunk {next_system_audio_recheck}"
+                        )
+                        log(
+                            "Hint: if recovery keeps failing, verify Screen Recording permissions "
+                            "or reboot to reset ScreenCaptureKit."
+                        )
+            elif dual_requested and system_audio_enabled:
                 if system_capture_fail_streak:
                     log(f"System audio capture recovered on chunk {n}")
                 system_capture_fail_streak = 0
