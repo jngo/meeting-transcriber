@@ -2,3 +2,5 @@ vendor/**/.build/
 vendor/**/ModuleCache/
 __pycache__/
 *.pyc
+build/
+dist/

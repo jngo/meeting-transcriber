@@ -13,7 +13,7 @@ from AppKit import (
 from Foundation import NSObject
 
 from config import load_config, save_config
-from runner import TRANSCRIBE_PY, TranscriptionRunner
+from runner import TranscriptionRunner, resolve_transcribe_cmd
 
 
 class State(enum.Enum):
@@ -65,14 +65,6 @@ class _MenuDelegate(NSObject):
 
 class MeetingTranscriberApp(rumps.App):
     def __init__(self):
-        # Initialize NSApplication before rumps so we can set activation policy.
-        # NSApp is None until sharedApplication() is called; rumps only does that
-        # inside run(), so we must call it here first.
-        from AppKit import NSApplication
-        NSApplication.sharedApplication().setActivationPolicy_(
-            NSApplicationActivationPolicyAccessory
-        )
-
         super().__init__("⏺", quit_button=None)
 
         self._state = State.IDLE
@@ -344,10 +336,11 @@ class MeetingTranscriberApp(rumps.App):
             cancel="Dismiss",
         ))
         if response == 1:
+            python, script = resolve_transcribe_cmd()
             for orphan in orphans:
                 md_path = orphan.parent / orphan.name[:-8]
                 subprocess.Popen(
-                    [sys.executable, str(TRANSCRIBE_PY), "--recover", str(md_path)],
+                    [python, script, "--recover", str(md_path)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )

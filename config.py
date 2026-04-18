@@ -8,6 +8,8 @@ DEFAULTS: dict = {
     "input_only": False,
     "last_transcript": None,
     "launch_at_login": False,
+    "venv_python": None,       # Absolute path set by --setup; used by .app to invoke transcribe.py
+    "transcribe_script": None, # Absolute path set by --setup; points to transcribe.py in the repo
 }
 
 

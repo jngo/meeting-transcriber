@@ -1,11 +1,45 @@
 import datetime
+import os
 import signal
 import subprocess
 import sys
 import threading
 from pathlib import Path
 
-TRANSCRIBE_PY = Path(__file__).resolve().parent / "transcribe.py"
+from config import load_config
+
+
+def resolve_transcribe_cmd() -> tuple[str, str]:
+    """Return (python_path, script_path) for invoking transcribe.py.
+
+    Paths are stored in config by --setup so they work when the app is launched
+    from Finder (where sys.executable is the bundled Python and the repo is not
+    on sys.path).
+    """
+    cfg = load_config()
+    python = cfg.get("venv_python") or sys.executable
+    script = cfg.get("transcribe_script") or str(
+        Path(__file__).resolve().parent / "transcribe.py"
+    )
+    return str(python), str(script)
+
+
+def _subprocess_env() -> dict:
+    """Return environ with Homebrew and user bin paths prepended.
+
+    Apps launched from Finder inherit a minimal PATH (/usr/bin:/bin only),
+    so ffmpeg and whisper-cli won't be found without this.
+    """
+    env = os.environ.copy()
+    prepend = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        str(Path.home() / ".local" / "bin"),
+    ]
+    current = env.get("PATH", "")
+    extra = ":".join(p for p in prepend if p not in current)
+    env["PATH"] = f"{extra}:{current}" if current else extra
+    return env
 
 
 class TranscriptionRunner:
@@ -29,10 +63,12 @@ class TranscriptionRunner:
         self._queued_dir = None
         self.done_event.clear()
         self._md_path.touch()  # Ensure file exists before subprocess initialises
+        python, script = resolve_transcribe_cmd()
         self._proc = subprocess.Popen(
-            [sys.executable, str(TRANSCRIBE_PY), str(self._md_path)],
+            [python, script, str(self._md_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=_subprocess_env(),
         )
         threading.Thread(target=self._monitor, args=(on_done,), daemon=True).start()
 
@@ -85,7 +121,6 @@ class TranscriptionRunner:
             dest.parent.mkdir(parents=True, exist_ok=True)
             if src.exists():
                 src.rename(dest)
-            # Move session file too in case the process was killed before cleanup
             src_session = Path(str(src) + ".session")
             if src_session.exists():
                 src_session.rename(Path(str(dest) + ".session"))
