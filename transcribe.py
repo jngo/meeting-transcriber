@@ -945,7 +945,7 @@ Examples:
 
     if args.gui:
         subprocess.Popen(
-            [str(VENV_PYTHON), str(SCRIPT_DIR / "menubar_app.py")],
+            [str(VENV_PYTHON), str(SCRIPT_DIR / "gui.py")],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
