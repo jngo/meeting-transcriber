@@ -4,7 +4,7 @@ from pathlib import Path
 CONFIG_PATH = Path.home() / ".config" / "meeting-transcriber" / "config.json"
 
 DEFAULTS: dict = {
-    "output_dir": "~/00 Inbox/Transcripts",
+    "output_dir": "~/Documents/Transcripts",
     "input_only": False,
     "last_transcript": None,
     "launch_at_login": False,

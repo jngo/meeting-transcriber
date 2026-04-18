@@ -228,7 +228,8 @@ def ensure_menubar_command():
     launcher = bin_dir / "meeting-transcriber-app"
     app_script = SCRIPT_DIR / "menubar_app.py"
     launcher.write_text(
-        f"#!/bin/sh\nexec '{VENV_PYTHON}' '{app_script}' \"$@\"\n"
+        f"#!/bin/sh\nnohup '{VENV_PYTHON}' '{app_script}' >/dev/null 2>&1 &\n"
+        f"echo \"Meeting Transcriber started (pid $!)\"\n"
     )
     launcher.chmod(launcher.stat().st_mode | 0o111)
     log(f"Linked: meeting-transcriber-app → {app_script}")

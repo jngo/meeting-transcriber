@@ -5,6 +5,12 @@ import sys
 from pathlib import Path
 
 import rumps
+from AppKit import (
+    NSApp,
+    NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyRegular,
+)
+from Foundation import NSObject
 
 from config import load_config, save_config
 from runner import TRANSCRIBE_PY, TranscriptionRunner
@@ -42,9 +48,28 @@ PLIST_TEMPLATE = """\
 """
 
 
+class _MenuDelegate(NSObject):
+    """Updates the elapsed-time menu item right before the menu opens.
+
+    rumps timers fire in NSDefaultRunLoopMode only. While an NSMenu is
+    being tracked (displayed) the run loop is in NSEventTrackingRunLoopMode,
+    so timers pause — making the elapsed display freeze. menuWillOpen_ fires
+    at exactly the right moment to show a current value.
+    """
+
+    def menuWillOpen_(self, menu):
+        app = getattr(self, "_app", None)
+        if app and app._state == State.RECORDING:
+            app._elapsed_item.title = f"Recording {app._runner.elapsed()}"
+
+
 class MeetingTranscriberApp(rumps.App):
     def __init__(self):
         super().__init__("⏺", quit_button=None)
+
+        # Hide the Dock icon — this is a menu bar-only app
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
         self._state = State.IDLE
         self._runner = TranscriptionRunner()
         self._cfg = load_config()
@@ -54,12 +79,17 @@ class MeetingTranscriberApp(rumps.App):
         # Reused menu item so in-place title updates work
         self._elapsed_item = rumps.MenuItem("Recording 0:00:00")
 
-        # All timers start stopped; started/stopped on state transitions
+        # Timers — all start stopped; started/stopped on state transitions
         self._pulse_timer = rumps.Timer(self._tick_pulse, 1.0)
-        self._elapsed_timer = rumps.Timer(self._tick_elapsed, 1.0)
         self._spinner_timer = rumps.Timer(self._tick_spinner, 0.1)
         self._done_timer = rumps.Timer(self._check_done, 0.5)
         self._restore_timer = rumps.Timer(self._restore_idle, 3.0)
+
+        # Attach NSMenuDelegate so elapsed time is fresh when the menu opens.
+        # self.menu._menu is the underlying NSMenu wrapped by rumps.Menu.
+        self._menu_delegate = _MenuDelegate.alloc().init()
+        self._menu_delegate._app = self
+        self.menu._menu.setDelegate_(self._menu_delegate)
 
         self._build_idle_menu()
         self._check_orphan_sessions()
@@ -119,13 +149,11 @@ class MeetingTranscriberApp(rumps.App):
             rumps.MenuItem("Stop Recording", callback=self._stop_recording),
         ])
         self._pulse_timer.start()
-        self._elapsed_timer.start()
         self._done_timer.start()
 
     def _enter_finalizing(self):
         self._state = State.FINALIZING
         self._pulse_timer.stop()
-        self._elapsed_timer.stop()
         self._spinner_idx = 0
         self.title = SPINNER_FRAMES[0]
         self._set_menu([rumps.MenuItem("Finalizing transcript…")])
@@ -138,7 +166,7 @@ class MeetingTranscriberApp(rumps.App):
         save_config(self._cfg)
         # Build idle menu immediately so Start Recording is available for back-to-back
         self._build_idle_menu()
-        self._state = State.DONE  # _build_idle_menu doesn't touch _state, but be explicit
+        self._state = State.DONE
         self.title = "✓"
         if final_path:
             rumps.notification(
@@ -161,9 +189,6 @@ class MeetingTranscriberApp(rumps.App):
         self._pulse_on = not self._pulse_on
         self.title = "●" if self._pulse_on else "○"
 
-    def _tick_elapsed(self, _):
-        self._elapsed_item.title = f"Recording {self._runner.elapsed()}"
-
     def _tick_spinner(self, _):
         self.title = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
         self._spinner_idx += 1
@@ -175,7 +200,6 @@ class MeetingTranscriberApp(rumps.App):
         if self._state == State.RECORDING:
             # Process exited before user clicked Stop
             self._pulse_timer.stop()
-            self._elapsed_timer.stop()
             self._enter_idle()
             rumps.notification(
                 "Recording stopped",
@@ -186,6 +210,17 @@ class MeetingTranscriberApp(rumps.App):
             final_path = self._runner.finalize_path()
             self._enter_done(final_path)
 
+    # ── Dialog focus helpers ──────────────────────────────────────────────────
+
+    def _show_dialog(self, fn):
+        """Run fn() with the app temporarily foregrounded so dialogs appear on top."""
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        NSApp.activateIgnoringOtherApps_(True)
+        try:
+            return fn()
+        finally:
+            NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
     # ── Actions ───────────────────────────────────────────────────────────────
 
     def _start_recording(self, _=None):
@@ -193,9 +228,7 @@ class MeetingTranscriberApp(rumps.App):
             return
         if self._state == State.DONE:
             self._restore_timer.stop()
-        out_dir = Path(
-            self._cfg.get("output_dir", "~/00 Inbox/Transcripts")
-        ).expanduser()
+        out_dir = Path(self._cfg.get("output_dir", "~/Documents/Transcripts")).expanduser()
         out_dir.mkdir(parents=True, exist_ok=True)
         self._runner.start(out_dir)
         self._enter_recording()
@@ -207,15 +240,16 @@ class MeetingTranscriberApp(rumps.App):
         self._enter_finalizing()
 
     def _set_title(self, _=None):
-        w = rumps.Window(
-            message="Enter a title for this recording:",
-            title="Set Meeting Title",
-            default_text=self._runner.queued_title or "",
-            ok="Set",
-            cancel="Cancel",
-            dimensions=(300, 24),
-        )
-        resp = w.run()
+        def show():
+            return rumps.Window(
+                message="Enter a title for this recording:",
+                title="Set Meeting Title",
+                default_text=self._runner.queued_title or "",
+                ok="Set",
+                cancel="Cancel",
+                dimensions=(300, 24),
+            ).run()
+        resp = self._show_dialog(show)
         if resp.clicked and resp.text.strip():
             self._runner.set_title(resp.text.strip())
 
@@ -246,15 +280,16 @@ class MeetingTranscriberApp(rumps.App):
             subprocess.run(["open", last])
 
     def _open_settings(self, _=None):
-        w = rumps.Window(
-            message="Default save directory for transcripts:",
-            title="Settings",
-            default_text=self._cfg.get("output_dir", "~/00 Inbox/Transcripts"),
-            ok="Save",
-            cancel="Cancel",
-            dimensions=(400, 24),
-        )
-        resp = w.run()
+        def show():
+            return rumps.Window(
+                message="Default save directory for transcripts:",
+                title="Settings",
+                default_text=self._cfg.get("output_dir", "~/Documents/Transcripts"),
+                ok="Save",
+                cancel="Cancel",
+                dimensions=(400, 24),
+            ).run()
+        resp = self._show_dialog(show)
         if resp.clicked and resp.text.strip():
             self._cfg["output_dir"] = resp.text.strip()
             save_config(self._cfg)
@@ -281,13 +316,13 @@ class MeetingTranscriberApp(rumps.App):
             )
             self._cfg["launch_at_login"] = True
         save_config(self._cfg)
-        self._build_idle_menu()  # Update checkmark
+        self._build_idle_menu()
 
     # ── Crash recovery ────────────────────────────────────────────────────────
 
     def _check_orphan_sessions(self):
         out_dir = Path(
-            self._cfg.get("output_dir", "~/00 Inbox/Transcripts")
+            self._cfg.get("output_dir", "~/Documents/Transcripts")
         ).expanduser()
         if not out_dir.exists():
             return
@@ -297,12 +332,12 @@ class MeetingTranscriberApp(rumps.App):
         names = "\n".join(f"  • {p.name[:-8]}" for p in orphans[:3])
         if len(orphans) > 3:
             names += f"\n  … and {len(orphans) - 3} more"
-        response = rumps.alert(
+        response = self._show_dialog(lambda: rumps.alert(
             title="Incomplete recordings found",
             message=f"These recordings were interrupted:\n\n{names}\n\nRecover them now?",
             ok="Recover",
             cancel="Dismiss",
-        )
+        ))
         if response == 1:
             for orphan in orphans:
                 md_path = orphan.parent / orphan.name[:-8]
