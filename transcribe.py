@@ -221,19 +221,6 @@ def ensure_rumps():
     )
 
 
-def ensure_menubar_command():
-    bin_dir = Path.home() / ".local" / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    launcher = bin_dir / "meeting-transcriber-app"
-    app_script = SCRIPT_DIR / "menubar_app.py"
-    launcher.write_text(
-        f"#!/bin/sh\nnohup '{VENV_PYTHON}' '{app_script}' >/dev/null 2>&1 &\n"
-        f"echo \"Meeting Transcriber started (pid $!)\"\n"
-    )
-    launcher.chmod(launcher.stat().st_mode | 0o111)
-    log(f"Linked: meeting-transcriber-app → {app_script}")
-
-
 def setup():
     if not shutil.which("brew"):
         sys.exit("Error: Homebrew is required — https://brew.sh")
@@ -243,8 +230,7 @@ def setup():
     ensure_command()
     ensure_skill()
     ensure_rumps()
-    ensure_menubar_command()
-    log("\nSetup complete. Start the menu bar app with:\n  meeting-transcriber-app")
+    log("\nSetup complete. Start the menu bar app with:\n  transcribe-meeting --gui")
 
 
 # ── Audio inputs ───────────────────────────────────────────────────────────
@@ -928,6 +914,7 @@ Examples:
   %(prog)s --list-inputs             List available input devices
   %(prog)s --recover meeting.md      Recover transcript from an interrupted transcription
   %(prog)s --setup                   Install dependencies only
+  %(prog)s --gui                     Launch the menu bar app
         """,
     )
     p.add_argument("file",           nargs="?", help="Markdown file to write transcript to")
@@ -941,6 +928,8 @@ Examples:
     p.add_argument("--recover",      action="store_true",
                    help="Recover transcript from an interrupted transcription session")
     p.add_argument("--setup",        action="store_true", help="Install dependencies")
+    p.add_argument("--gui",          action="store_true",
+                   help="Launch the menu bar app (runs detached in the background)")
 
     args = p.parse_args()
 
@@ -954,6 +943,16 @@ Examples:
 
     if args.setup:
         log("All dependencies ready.")
+        return
+
+    if args.gui:
+        subprocess.Popen(
+            [str(VENV_PYTHON), str(SCRIPT_DIR / "menubar_app.py")],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print("Meeting Transcriber started")
         return
 
     if args.list_inputs:
