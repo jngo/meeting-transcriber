@@ -200,6 +200,18 @@ def ensure_skill():
             log(f"Linked: {client} skill → {skill_src}")
 
 
+def ensure_rumps():
+    try:
+        import rumps  # noqa: F401
+        log("rumps already installed")
+    except ImportError:
+        log("Installing rumps (menu bar app framework)...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "rumps"],
+            check=True,
+        )
+
+
 def setup():
     if not shutil.which("brew"):
         sys.exit("Error: Homebrew is required — https://brew.sh")
@@ -208,6 +220,11 @@ def setup():
     ensure_system_audio_tap()
     ensure_command()
     ensure_skill()
+    ensure_rumps()
+    log(
+        "\nMenu bar app ready. Run it with:\n"
+        f"  python3 {Path(__file__).resolve().parent / 'menubar_app.py'}"
+    )
 
 
 # ── Audio inputs ───────────────────────────────────────────────────────────
