@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+import datetime
+import enum
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import rumps
+from AppKit import (
+    NSApp,
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyRegular,
+)
+from Foundation import NSObject
+
+from config import load_config, save_config
+
+TRANSCRIBE_PY = Path(__file__).resolve().parent / "transcribe.py"
+
+
+class TranscriptionRunner:
+    def __init__(self):
+        self._proc: subprocess.Popen | None = None
+        self._md_path: Path | None = None
+        self._date_prefix: str = ""
+        self._start_time: datetime.datetime | None = None
+        self._final_elapsed: str | None = None
+        self._queued_title: str | None = None
+        self._queued_dir: Path | None = None
+        self.done_event = threading.Event()
+
+    def start(self, out_dir: Path):
+        now = datetime.datetime.now()
+        self._date_prefix = now.strftime("%Y-%m-%d %H-%M")
+        self._md_path = out_dir / f"{self._date_prefix} Untitled.md"
+        self._start_time = now
+        self._final_elapsed = None
+        self._queued_title = None
+        self._queued_dir = None
+        self.done_event.clear()
+        self._md_path.touch()  # Ensure file exists before subprocess initialises
+        self._proc = subprocess.Popen(
+            [sys.executable, str(TRANSCRIBE_PY), str(self._md_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        threading.Thread(target=self._monitor, daemon=True).start()
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            self._final_elapsed = self.elapsed()
+            self._proc.send_signal(signal.SIGINT)
+
+    def set_title(self, title: str):
+        self._queued_title = title.strip() or None
+
+    def set_dir(self, dir_path: Path):
+        self._queued_dir = dir_path
+
+    @property
+    def queued_title(self) -> str | None:
+        return self._queued_title
+
+    @property
+    def md_path(self) -> Path | None:
+        return self._md_path
+
+    def elapsed(self) -> str:
+        if self._final_elapsed is not None:
+            return self._final_elapsed
+        if self._start_time is None:
+            return "0:00:00"
+        total = int((datetime.datetime.now() - self._start_time).total_seconds())
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}"
+
+    def finalize_path(self) -> Path | None:
+        if self._md_path is None:
+            return None
+        src = self._md_path
+        out_dir = (
+            Path(self._queued_dir).expanduser()
+            if self._queued_dir
+            else src.parent
+        )
+        name = (
+            f"{self._date_prefix} {self._queued_title}.md"
+            if self._queued_title
+            else src.name
+        )
+        dest = out_dir / name
+        if src != dest:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if src.exists():
+                src.rename(dest)
+            src_session = Path(str(src) + ".session")
+            if src_session.exists():
+                src_session.rename(Path(str(dest) + ".session"))
+        return dest
+
+    def _monitor(self):
+        self._proc.wait()
+        self.done_event.set()
+
+
+class State(enum.Enum):
+    IDLE = "idle"
+    RECORDING = "recording"
+    FINALIZING = "finalizing"
+    DONE = "done"
+
+
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+LAUNCH_AGENT_LABEL = "com.meeting-transcriber"
+LAUNCH_AGENT_PATH = (
+    Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+)
+PLIST_TEMPLATE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{python}</string>
+    <string>{script}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+</dict>
+</plist>
+"""
+
+
+class _MenuDelegate(NSObject):
+    """Updates the elapsed-time menu item right before the menu opens.
+
+    rumps timers fire in NSDefaultRunLoopMode only. While an NSMenu is
+    being tracked (displayed) the run loop is in NSEventTrackingRunLoopMode,
+    so timers pause — making the elapsed display freeze. menuWillOpen_ fires
+    at exactly the right moment to show a current value.
+    """
+
+    def menuWillOpen_(self, menu):
+        app = getattr(self, "_app", None)
+        if app and app._state == State.RECORDING:
+            app._elapsed_item.title = f"Recording {app._runner.elapsed()}"
+
+
+class MeetingTranscriberApp(rumps.App):
+    def __init__(self):
+        # NSApp is None until sharedApplication() is called; rumps only does
+        # that inside run(), so call it here first to set activation policy.
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+
+        super().__init__("⏺", quit_button=None)
+
+        self._state = State.IDLE
+        self._runner = TranscriptionRunner()
+        self._cfg = load_config()
+        self._spinner_idx = 0
+        self._pulse_on = True
+
+        # Reused menu item so in-place title updates work
+        self._elapsed_item = rumps.MenuItem("Recording 0:00:00")
+
+        # Timers — all start stopped; started/stopped on state transitions
+        self._pulse_timer = rumps.Timer(self._tick_pulse, 1.0)
+        self._spinner_timer = rumps.Timer(self._tick_spinner, 0.1)
+        self._done_timer = rumps.Timer(self._check_done, 0.5)
+        self._restore_timer = rumps.Timer(self._restore_idle, 3.0)
+
+        # Attach NSMenuDelegate so elapsed time is fresh when the menu opens.
+        # self.menu._menu is the underlying NSMenu wrapped by rumps.Menu.
+        self._menu_delegate = _MenuDelegate.alloc().init()
+        self._menu_delegate._app = self
+        self.menu._menu.setDelegate_(self._menu_delegate)
+
+        self._build_idle_menu()
+        self._check_orphan_sessions()
+
+    # ── Menu helpers ──────────────────────────────────────────────────────────
+
+    def _set_menu(self, items):
+        self.menu.clear()
+        for item in items:
+            if item is None:
+                self.menu.add(rumps.separator)
+            else:
+                self.menu.add(item)
+
+    def _build_idle_menu(self):
+        last = self._cfg.get("last_transcript")
+        open_item = rumps.MenuItem(
+            "Open Last Transcript",
+            callback=self._open_last if last else None,
+        )
+        login_label = (
+            "✓ Launch at Login"
+            if self._cfg.get("launch_at_login")
+            else "Launch at Login"
+        )
+        self._set_menu([
+            rumps.MenuItem("Start Recording", callback=self._start_recording),
+            None,
+            open_item,
+            None,
+            rumps.MenuItem(login_label, callback=self._toggle_launch_at_login),
+            rumps.MenuItem("Settings…", callback=self._open_settings),
+            None,
+            rumps.MenuItem("Quit", callback=rumps.quit_application),
+        ])
+
+    # ── State transitions ─────────────────────────────────────────────────────
+
+    def _enter_idle(self):
+        self._state = State.IDLE
+        self.title = "⏺"
+        self._build_idle_menu()
+
+    def _enter_recording(self):
+        self._state = State.RECORDING
+        self._pulse_on = True
+        self.title = "●"
+        self._elapsed_item.title = f"Recording {self._runner.elapsed()}"
+        self._set_menu([
+            self._elapsed_item,
+            None,
+            rumps.MenuItem("View Live Transcript", callback=self._view_live_transcript),
+            None,
+            rumps.MenuItem("Set Title…", callback=self._set_title),
+            rumps.MenuItem("Set Save Location…", callback=self._set_save_location),
+            None,
+            rumps.MenuItem("Stop Recording", callback=self._stop_recording),
+        ])
+        self._pulse_timer.start()
+        self._done_timer.start()
+
+    def _enter_finalizing(self):
+        self._state = State.FINALIZING
+        self._pulse_timer.stop()
+        self._spinner_idx = 0
+        self.title = SPINNER_FRAMES[0]
+        self._set_menu([rumps.MenuItem("Finalizing transcript…")])
+        self._spinner_timer.start()
+
+    def _enter_done(self, final_path: Path | None):
+        self._state = State.DONE
+        self._spinner_timer.stop()
+        self._cfg["last_transcript"] = str(final_path) if final_path else None
+        save_config(self._cfg)
+        # Build idle menu immediately so Start Recording is available for back-to-back
+        self._build_idle_menu()
+        self._state = State.DONE
+        self.title = "✓"
+        if final_path:
+            rumps.notification(
+                "Transcript saved",
+                self._runner.elapsed(),
+                final_path.stem,
+                data=str(final_path),
+            )
+        self._restore_timer.start()
+
+    def _restore_idle(self, _):
+        self._restore_timer.stop()
+        if self._state == State.DONE:
+            self._state = State.IDLE
+            self.title = "⏺"
+
+    # ── Timer callbacks ───────────────────────────────────────────────────────
+
+    def _tick_pulse(self, _):
+        self._pulse_on = not self._pulse_on
+        self.title = "●" if self._pulse_on else "○"
+
+    def _tick_spinner(self, _):
+        self.title = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
+        self._spinner_idx += 1
+
+    def _check_done(self, _):
+        if not self._runner.done_event.is_set():
+            return
+        self._done_timer.stop()
+        if self._state == State.RECORDING:
+            # Process exited before user clicked Stop
+            self._pulse_timer.stop()
+            self._enter_idle()
+            rumps.notification(
+                "Recording stopped",
+                "",
+                "The transcription process ended unexpectedly.",
+            )
+        elif self._state == State.FINALIZING:
+            final_path = self._runner.finalize_path()
+            self._enter_done(final_path)
+
+    # ── Dialog focus helpers ──────────────────────────────────────────────────
+
+    def _show_dialog(self, fn):
+        """Run fn() with the app temporarily foregrounded so dialogs appear on top."""
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        NSApp.activateIgnoringOtherApps_(True)
+        try:
+            return fn()
+        finally:
+            NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _start_recording(self, _=None):
+        if self._state not in (State.IDLE, State.DONE):
+            return
+        if self._state == State.DONE:
+            self._restore_timer.stop()
+        out_dir = Path(self._cfg.get("output_dir", "~/Documents/Transcripts")).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._runner.start(out_dir)
+        self._enter_recording()
+
+    def _stop_recording(self, _=None):
+        if self._state != State.RECORDING:
+            return
+        self._runner.stop()
+        self._enter_finalizing()
+
+    def _set_title(self, _=None):
+        def show():
+            return rumps.Window(
+                message="Enter a title for this recording:",
+                title="Set Meeting Title",
+                default_text=self._runner.queued_title or "",
+                ok="Set",
+                cancel="Cancel",
+                dimensions=(300, 24),
+            ).run()
+        resp = self._show_dialog(show)
+        if resp.clicked and resp.text.strip():
+            self._runner.set_title(resp.text.strip())
+
+    def _set_save_location(self, _=None):
+        result = subprocess.run(
+            [
+                "osascript", "-e",
+                'POSIX path of (choose folder with prompt "Select output directory:")',
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            chosen = result.stdout.strip().rstrip("/")
+            if chosen:
+                self._runner.set_dir(Path(chosen))
+                self._cfg["output_dir"] = chosen
+                save_config(self._cfg)
+
+    def _view_live_transcript(self, _=None):
+        path = self._runner.md_path
+        if path and path.exists():
+            subprocess.run(["open", str(path)])
+
+    def _open_last(self, _=None):
+        last = self._cfg.get("last_transcript")
+        if last and Path(last).exists():
+            subprocess.run(["open", last])
+
+    def _open_settings(self, _=None):
+        def show():
+            return rumps.Window(
+                message="Default save directory for transcripts:",
+                title="Settings",
+                default_text=self._cfg.get("output_dir", "~/Documents/Transcripts"),
+                ok="Save",
+                cancel="Cancel",
+                dimensions=(400, 24),
+            ).run()
+        resp = self._show_dialog(show)
+        if resp.clicked and resp.text.strip():
+            self._cfg["output_dir"] = resp.text.strip()
+            save_config(self._cfg)
+
+    def _toggle_launch_at_login(self, _=None):
+        if self._cfg.get("launch_at_login"):
+            subprocess.run(
+                ["launchctl", "unload", str(LAUNCH_AGENT_PATH)],
+                capture_output=True,
+            )
+            LAUNCH_AGENT_PATH.unlink(missing_ok=True)
+            self._cfg["launch_at_login"] = False
+        else:
+            plist = PLIST_TEMPLATE.format(
+                label=LAUNCH_AGENT_LABEL,
+                python=sys.executable,
+                script=str(Path(__file__).resolve()),
+            )
+            LAUNCH_AGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LAUNCH_AGENT_PATH.write_text(plist)
+            subprocess.run(
+                ["launchctl", "load", str(LAUNCH_AGENT_PATH)],
+                capture_output=True,
+            )
+            self._cfg["launch_at_login"] = True
+        save_config(self._cfg)
+        self._build_idle_menu()
+
+    # ── Crash recovery ────────────────────────────────────────────────────────
+
+    def _check_orphan_sessions(self):
+        out_dir = Path(
+            self._cfg.get("output_dir", "~/Documents/Transcripts")
+        ).expanduser()
+        if not out_dir.exists():
+            return
+        orphans = sorted(out_dir.glob("*.md.session"))
+        if not orphans:
+            return
+        names = "\n".join(f"  • {p.name[:-8]}" for p in orphans[:3])
+        if len(orphans) > 3:
+            names += f"\n  … and {len(orphans) - 3} more"
+        response = self._show_dialog(lambda: rumps.alert(
+            title="Incomplete recordings found",
+            message=f"These recordings were interrupted:\n\n{names}\n\nRecover them now?",
+            ok="Recover",
+            cancel="Dismiss",
+        ))
+        if response == 1:
+            for orphan in orphans:
+                md_path = orphan.parent / orphan.name[:-8]
+                subprocess.Popen(
+                    [sys.executable, str(TRANSCRIBE_PY), "--recover", str(md_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+    # ── Notification handler ──────────────────────────────────────────────────
+
+    @rumps.notifications
+    def notification_center(self, info):
+        if isinstance(info, str) and Path(info).exists():
+            subprocess.run(["open", info])
+
+
+if __name__ == "__main__":
+    MeetingTranscriberApp().run()

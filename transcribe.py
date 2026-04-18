@@ -44,6 +44,9 @@ MODEL_URL    = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-m
 SWIFT_PROJECT  = VENDOR_DIR / "system-audio-tap"
 SYSTEM_TAP_BIN = SWIFT_PROJECT / ".build" / "release" / "system-audio-tap"
 
+VENV_DIR    = CACHE_DIR / "venv"
+VENV_PYTHON = VENV_DIR / "bin" / "python"
+
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -200,6 +203,23 @@ def ensure_skill():
             log(f"Linked: {client} skill → {skill_src}")
 
 
+def ensure_rumps():
+    if not VENV_PYTHON.exists():
+        log("Creating virtual environment for menu bar app...")
+        subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
+    result = subprocess.run(
+        [str(VENV_PYTHON), "-c", "import rumps"],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return
+    log("Installing rumps into virtual environment...")
+    subprocess.run(
+        [str(VENV_DIR / "bin" / "pip"), "install", "rumps"],
+        check=True,
+    )
+
+
 def setup():
     if not shutil.which("brew"):
         sys.exit("Error: Homebrew is required — https://brew.sh")
@@ -208,6 +228,7 @@ def setup():
     ensure_system_audio_tap()
     ensure_command()
     ensure_skill()
+    ensure_rumps()
 
 
 # ── Audio inputs ───────────────────────────────────────────────────────────
@@ -891,6 +912,7 @@ Examples:
   %(prog)s --list-inputs             List available input devices
   %(prog)s --recover meeting.md      Recover transcript from an interrupted transcription
   %(prog)s --setup                   Install dependencies only
+  %(prog)s --gui                     Launch the menu bar app
         """,
     )
     p.add_argument("file",           nargs="?", help="Markdown file to write transcript to")
@@ -904,6 +926,8 @@ Examples:
     p.add_argument("--recover",      action="store_true",
                    help="Recover transcript from an interrupted transcription session")
     p.add_argument("--setup",        action="store_true", help="Install dependencies")
+    p.add_argument("--gui",          action="store_true",
+                   help="Launch the menu bar app (runs detached in the background)")
 
     args = p.parse_args()
 
@@ -916,7 +940,17 @@ Examples:
     setup()
 
     if args.setup:
-        log("All dependencies ready.")
+        log("Setup complete.")
+        return
+
+    if args.gui:
+        subprocess.Popen(
+            [str(VENV_PYTHON), str(SCRIPT_DIR / "gui.py")],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print("Meeting Transcriber started")
         return
 
     if args.list_inputs:
