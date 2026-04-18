@@ -111,6 +111,8 @@ class MeetingTranscriberApp(rumps.App):
         self._set_menu([
             self._elapsed_item,
             None,
+            rumps.MenuItem("View Live Transcript", callback=self._view_live_transcript),
+            None,
             rumps.MenuItem("Set Title…", callback=self._set_title),
             rumps.MenuItem("Set Save Location…", callback=self._set_save_location),
             None,
@@ -232,6 +234,11 @@ class MeetingTranscriberApp(rumps.App):
                 self._runner.set_dir(Path(chosen))
                 self._cfg["output_dir"] = chosen
                 save_config(self._cfg)
+
+    def _view_live_transcript(self, _=None):
+        path = self._runner.md_path
+        if path and path.exists():
+            subprocess.run(["open", str(path)])
 
     def _open_last(self, _=None):
         last = self._cfg.get("last_transcript")

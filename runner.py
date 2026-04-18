@@ -28,6 +28,7 @@ class TranscriptionRunner:
         self._queued_title = None
         self._queued_dir = None
         self.done_event.clear()
+        self._md_path.touch()  # Ensure file exists before subprocess initialises
         self._proc = subprocess.Popen(
             [sys.executable, str(TRANSCRIBE_PY), str(self._md_path)],
             stdout=subprocess.DEVNULL,
@@ -49,6 +50,10 @@ class TranscriptionRunner:
     @property
     def queued_title(self) -> str | None:
         return self._queued_title
+
+    @property
+    def md_path(self) -> Path | None:
+        return self._md_path
 
     def elapsed(self) -> str:
         if self._final_elapsed is not None:
