@@ -221,54 +221,17 @@ def ensure_rumps():
     )
 
 
-def ensure_menubar_app():
-    """Build Meeting Transcriber.app via py2app and install to ~/Applications."""
-    # Install py2app into the venv
-    log("Installing py2app...")
-    subprocess.run(
-        [str(VENV_DIR / "bin" / "pip"), "install", "py2app"],
-        check=True,
+def ensure_menubar_command():
+    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher = bin_dir / "meeting-transcriber-app"
+    app_script = SCRIPT_DIR / "menubar_app.py"
+    launcher.write_text(
+        f"#!/bin/sh\nnohup '{VENV_PYTHON}' '{app_script}' >/dev/null 2>&1 &\n"
+        f"echo \"Meeting Transcriber started (pid $!)\"\n"
     )
-
-    # Store the venv Python and transcribe.py paths in config so the bundled
-    # app can invoke transcribe.py correctly when launched from Finder (where
-    # sys.executable is the bundle Python and the repo is not on sys.path).
-    import json as _json
-    config_path = Path.home() / ".config" / "meeting-transcriber" / "config.json"
-    cfg = {}
-    if config_path.exists():
-        try:
-            cfg = _json.loads(config_path.read_text())
-        except Exception:
-            pass
-    cfg["venv_python"] = str(VENV_PYTHON)
-    cfg["transcribe_script"] = str(SCRIPT_DIR / "transcribe.py")
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(_json.dumps(cfg, indent=2))
-
-    # Build the .app bundle
-    log("Building Meeting Transcriber.app (this may take a minute)...")
-    subprocess.run(
-        [str(VENV_PYTHON), str(SCRIPT_DIR / "setup.py"), "py2app"],
-        check=True,
-        cwd=str(SCRIPT_DIR),
-    )
-
-    # Install to ~/Applications, replacing any existing build
-    app_name = "Meeting Transcriber.app"
-    src = SCRIPT_DIR / "dist" / app_name
-    dest_dir = Path.home() / "Applications"
-    dest_dir.mkdir(exist_ok=True)
-    dest = dest_dir / app_name
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.move(str(src), str(dest))
-    log(f"Installed: {dest}")
-
-    # Remove old nohup launcher if present from previous setup
-    old_launcher = Path.home() / ".local" / "bin" / "meeting-transcriber-app"
-    if old_launcher.exists() or old_launcher.is_symlink():
-        old_launcher.unlink()
+    launcher.chmod(launcher.stat().st_mode | 0o111)
+    log(f"Linked: meeting-transcriber-app → {app_script}")
 
 
 def setup():
@@ -280,12 +243,8 @@ def setup():
     ensure_command()
     ensure_skill()
     ensure_rumps()
-    ensure_menubar_app()
-    log(
-        "\nSetup complete.\n"
-        "Launch Meeting Transcriber from Finder, Spotlight, or:\n"
-        "  open ~/Applications/Meeting\\ Transcriber.app"
-    )
+    ensure_menubar_command()
+    log("\nSetup complete. Start the menu bar app with:\n  meeting-transcriber-app")
 
 
 # ── Audio inputs ───────────────────────────────────────────────────────────
