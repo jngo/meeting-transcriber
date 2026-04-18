@@ -212,7 +212,6 @@ def ensure_rumps():
         capture_output=True,
     )
     if result.returncode == 0:
-        log("rumps already installed")
         return
     log("Installing rumps into virtual environment...")
     subprocess.run(
@@ -230,7 +229,6 @@ def setup():
     ensure_command()
     ensure_skill()
     ensure_rumps()
-    log("\nSetup complete. Start the menu bar app with:\n  transcribe-meeting --gui")
 
 
 # ── Audio inputs ───────────────────────────────────────────────────────────
@@ -942,7 +940,7 @@ Examples:
     setup()
 
     if args.setup:
-        log("All dependencies ready.")
+        log("Setup complete.")
         return
 
     if args.gui:
