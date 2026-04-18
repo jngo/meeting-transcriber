@@ -44,6 +44,9 @@ MODEL_URL    = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-m
 SWIFT_PROJECT  = VENDOR_DIR / "system-audio-tap"
 SYSTEM_TAP_BIN = SWIFT_PROJECT / ".build" / "release" / "system-audio-tap"
 
+VENV_DIR    = CACHE_DIR / "venv"
+VENV_PYTHON = VENV_DIR / "bin" / "python"
+
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -201,15 +204,34 @@ def ensure_skill():
 
 
 def ensure_rumps():
-    try:
-        import rumps  # noqa: F401
+    if not VENV_PYTHON.exists():
+        log("Creating virtual environment for menu bar app...")
+        subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
+    result = subprocess.run(
+        [str(VENV_PYTHON), "-c", "import rumps"],
+        capture_output=True,
+    )
+    if result.returncode == 0:
         log("rumps already installed")
-    except ImportError:
-        log("Installing rumps (menu bar app framework)...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "rumps"],
-            check=True,
-        )
+        return
+    log("Installing rumps into virtual environment...")
+    subprocess.run(
+        [str(VENV_DIR / "bin" / "pip"), "install", "rumps"],
+        check=True,
+    )
+
+
+def ensure_menubar_command():
+    """Create a launcher script that runs menubar_app.py with the venv Python."""
+    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher = bin_dir / "meeting-transcriber-app"
+    app_script = SCRIPT_DIR / "menubar_app.py"
+    launcher.write_text(
+        f"#!/bin/sh\nexec '{VENV_PYTHON}' '{app_script}' \"$@\"\n"
+    )
+    launcher.chmod(launcher.stat().st_mode | 0o111)
+    log(f"Linked: meeting-transcriber-app → {app_script}")
 
 
 def setup():
@@ -221,10 +243,8 @@ def setup():
     ensure_command()
     ensure_skill()
     ensure_rumps()
-    log(
-        "\nMenu bar app ready. Run it with:\n"
-        f"  python3 {Path(__file__).resolve().parent / 'menubar_app.py'}"
-    )
+    ensure_menubar_command()
+    log("\nSetup complete. Start the menu bar app with:\n  meeting-transcriber-app")
 
 
 # ── Audio inputs ───────────────────────────────────────────────────────────
