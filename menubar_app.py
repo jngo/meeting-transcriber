@@ -65,10 +65,15 @@ class _MenuDelegate(NSObject):
 
 class MeetingTranscriberApp(rumps.App):
     def __init__(self):
-        super().__init__("⏺", quit_button=None)
+        # Initialize NSApplication before rumps so we can set activation policy.
+        # NSApp is None until sharedApplication() is called; rumps only does that
+        # inside run(), so we must call it here first.
+        from AppKit import NSApplication
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
 
-        # Hide the Dock icon — this is a menu bar-only app
-        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        super().__init__("⏺", quit_button=None)
 
         self._state = State.IDLE
         self._runner = TranscriptionRunner()
