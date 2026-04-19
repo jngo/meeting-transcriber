@@ -1,0 +1,32 @@
+name: MeetingTranscriber
+options:
+  bundleIdPrefix: com.jngo
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "15"
+  createIntermediateGroups: true
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    from: "0.9.0"
+targets:
+  MeetingTranscriber:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: MeetingTranscriber
+    info:
+      path: MeetingTranscriber/Info.plist
+    entitlements:
+      path: MeetingTranscriber/MeetingTranscriber.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.jngo.MeetingTranscriber
+        SWIFT_VERSION: "5.10"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+    dependencies:
+      - package: WhisperKit
+        product: WhisperKit
